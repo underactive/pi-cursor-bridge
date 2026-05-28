@@ -1,5 +1,5 @@
 /**
- * cursor-acp Pi Extension
+ * pi-cursor-agent Pi Extension
  *
  * Starts an OpenAI-compatible HTTP proxy server on port 32124 that wraps
  * Cursor's `cursor-agent` CLI. This lets Pi (and any OpenAI-compatible
@@ -8,7 +8,7 @@
  *
  * Usage:
  *   1. Restart Pi or run /reload
- *   2. Open /model and select a cursor-acp/... model
+ *   2. Open /model and select a cursor-agent/... model
  *   3. Start chatting!
  *
  * Requires `cursor-agent` to be logged in:
@@ -19,18 +19,21 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { Box, Markdown, Text } from "@earendil-works/pi-tui";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 
 // ─── Config ───────────────────────────────────────────────────────────
 
 const PORT = 32124;
 const HOST = "127.0.0.1";
-const PROVIDER_ID = "cursor-acp";
+const PROVIDER_ID = "cursor-agent";
+const HEALTH_SERVICE_ID = "cursor-agent";
 
 /**
  * Resolve the cursor-agent binary path.
  */
 function resolveCursorAgent() {
-  const envPath = process.env.CURSOR_ACP_CURSOR_AGENT_PATH;
+  const envPath = process.env.PI_CURSOR_AGENT_PATH;
   if (envPath && fs.existsSync(envPath)) return envPath;
 
   const home = process.env.HOME || process.env.USERPROFILE || "/tmp";
@@ -47,7 +50,7 @@ function resolveCursorAgent() {
 }
 
 function cursorAgentPath() {
-  return process.env.CURSOR_ACP_CURSOR_AGENT_PATH || resolveCursorAgent();
+  return process.env.PI_CURSOR_AGENT_PATH || resolveCursorAgent();
 }
 
 /**
@@ -120,15 +123,7 @@ function buildPromptFromMessages(messages) {
 
 function normalizeModel(modelId) {
   if (!modelId) return "auto";
-  return modelId.replace(/^cursor-acp\//, "");
-}
-
-/**
- * Strip cursor-agent's model-intro banner.
- * Format: `**Model:** Composer (Auto)\n\nactual response...`
- */
-function stripModelIntro(text) {
-  return text.replace(/^\*\*Model:\*\*.*?\n\n/, "");
+  return modelId.replace(/^cursor-agent\//, "");
 }
 
 /**
@@ -175,19 +170,24 @@ function handleChatCompletions(req, res) {
 
     const cursorModel = normalizeModel(model);
     const prompt = buildPromptFromMessages(messages);
-    const id = `cursor-acp-${Date.now()}`;
+    const id = `cursor-agent-${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
 
+    // --force auto-approves all tool calls (bash, file ops, etc.)
+    // without it, cursor-agent rejects every tool execution, making
+    // models unable to run commands or access the filesystem.
+    // Safe because the proxy binds to 127.0.0.1:32124 only.
     const args = [
       "--print", "--output-format", "stream-json",
-      "--stream-partial-output",
-      "--model", cursorModel, "--trust",
+      "--model", cursorModel, "--trust", "--force",
     ];
+    if (stream) {
+      args.push("--stream-partial-output");
+    }
 
     const child = spawn(cursorAgentPath(), args, {
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32",
-      env: { ...process.env, CURSOR_ACP_LOG_LEVEL: "error" },
     });
 
     child.stdin.write(prompt);
@@ -201,11 +201,50 @@ function handleChatCompletions(req, res) {
         Connection: "keep-alive",
       });
 
-      let accumulated = "";
-      let streaming = false;
+      // With --stream-partial-output, assistant events are usually incremental
+      // deltas; the stream may end with one cumulative snapshot. Track assembled
+      // text so we only forward the new suffix and skip duplicate finals.
+      let assembledText = "";
       let usage = null;
-      let stderr = "";
-      child.stderr.on("data", (d) => (stderr += d.toString()));
+      child.stderr.on("data", () => { /* errors surfaced via [DONE] for now */ });
+
+      const writeChunk = (content) => {
+        if (!content) return;
+        res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n`);
+      };
+
+      const forwardAssistantText = (text) => {
+        if (!text) return;
+        let delta;
+        if (text.startsWith(assembledText)) {
+          delta = text.slice(assembledText.length);
+          assembledText = text;
+        } else {
+          delta = text;
+          assembledText += text;
+        }
+        writeChunk(delta);
+      };
+
+      const handleStreamEvent = (event) => {
+        if (event.type === "thinking") return;
+
+        if (event.type === "tool_call") {
+          assembledText = "";
+          return;
+        }
+
+        if (event.type === "assistant" && event.message?.content) {
+          for (const block of event.message.content) {
+            if (block.type !== "text" || !block.text) continue;
+            forwardAssistantText(block.text);
+          }
+        }
+
+        if (event.type === "result") {
+          usage = event.usage || null;
+        }
+      };
 
       const lineBuffer = [];
       child.stdout.on("data", (d) => {
@@ -216,51 +255,7 @@ function handleChatCompletions(req, res) {
           const line = lines[i].trim();
           if (!line) continue;
           try {
-            const event = JSON.parse(line);
-            if (event.type === "thinking") continue;
-
-            // Reset tracking on tool_call — cursor-agent outputs a new
-            // assistant phase after tool calls, and the final event only
-            // contains the LAST phase's text, not the accumulated total.
-            if (event.type === "tool_call") {
-              accumulated = "";
-              streaming = false;
-            }
-
-            if (event.type === "assistant" && event.message?.content) {
-              for (const block of event.message.content) {
-                if (block.type !== "text" || !block.text) continue;
-                const fullText = block.text;
-
-                // Compute delta (final event has complete text)
-                let delta = fullText;
-                if (accumulated && fullText.startsWith(accumulated)) {
-                  delta = fullText.slice(accumulated.length);
-                }
-                if (!delta) continue;
-                accumulated += delta;
-
-                if (!streaming) {
-                  // Buffer until we can identify/drop the intro banner
-                  const cleaned = stripModelIntro(accumulated);
-                  if (cleaned !== accumulated) {
-                    streaming = true;
-                    if (cleaned) {
-                      res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: { content: cleaned }, finish_reason: null }] })}\n\n`);
-                    }
-                  } else if (accumulated.length > 0 && !"**Model:".startsWith(accumulated) && !accumulated.startsWith("**Model:")) {
-                    streaming = true;
-                    res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: { content: accumulated }, finish_reason: null }] })}\n\n`);
-                  }
-                } else {
-                  res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })}\n\n`);
-                }
-              }
-            }
-
-            if (event.type === "result") {
-              usage = event.usage || null;
-            }
+            handleStreamEvent(JSON.parse(line));
           } catch { /* skip unparseable lines */ }
         }
 
@@ -274,8 +269,7 @@ function handleChatCompletions(req, res) {
         for (const line of lineBuffer) {
           if (!line.trim()) continue;
           try {
-            const event = JSON.parse(line.trim());
-            if (event.type === "result") usage = event.usage || usage;
+            handleStreamEvent(JSON.parse(line.trim()));
           } catch {}
         }
 
@@ -334,7 +328,7 @@ function handleChatCompletions(req, res) {
           object: "chat.completion",
           created,
           model: cursorModel,
-          choices: [{ index: 0, message: { role: "assistant", content: errorText || stripModelIntro(assistantText || "No response") }, finish_reason: errorText ? "error" : "stop" }],
+          choices: [{ index: 0, message: { role: "assistant", content: errorText || assistantText || "No response" }, finish_reason: errorText ? "error" : "stop" }],
           usage: usage ? { prompt_tokens: usage.inputTokens ?? 0, completion_tokens: usage.outputTokens ?? 0, total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0) } : undefined,
         }));
       });
@@ -345,6 +339,50 @@ function handleChatCompletions(req, res) {
       });
     }
   });
+}
+
+// ─── Peer discovery ───────────────────────────────────────────────────
+
+/**
+ * GET a small JSON document from the local proxy. Resolves to the parsed
+ * body, or `null` if the request fails for any reason (no server, wrong
+ * service, timeout, etc.). Used to detect a sibling Pi instance that
+ * already owns the proxy port so we can run in client-only mode.
+ */
+function fetchLocalJson(pathname, timeoutMs = 750) {
+  return new Promise((resolve) => {
+    const req = http.request(
+      { host: HOST, port: PORT, path: pathname, method: "GET", timeout: timeoutMs },
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          resolve(null);
+          return;
+        }
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => (body += chunk));
+        res.on("end", () => {
+          try { resolve(JSON.parse(body)); }
+          catch { resolve(null); }
+        });
+      }
+    );
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+/**
+ * Probe http://127.0.0.1:32124/health and confirm a pi-cursor-agent proxy
+ * is already running there (vs. some unrelated service squatting on
+ * the port). Returns true only when the running server identifies
+ * itself as cursor-agent.
+ */
+async function detectExistingProxy() {
+  const health = await fetchLocalJson("/health");
+  return !!(health && health.ok === true && health.service === HEALTH_SERVICE_ID);
 }
 
 // ─── HTTP Server ──────────────────────────────────────────────────────
@@ -376,7 +414,7 @@ function startProxyServer(modelsFn) {
 
       if (url.pathname === "/health" && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, service: HEALTH_SERVICE_ID }));
         return;
       }
 
@@ -392,13 +430,136 @@ function startProxyServer(modelsFn) {
 
 // ─── Extension entry point ────────────────────────────────────────────
 
+/** @type {{ lines: string[] } | { error: string } | null} */
+let startupLog = null;
+
+let startupLogHandlerRegistered = false;
+
+function scheduleStartupLog(pi) {
+  if (startupLogHandlerRegistered) return;
+  startupLogHandlerRegistered = true;
+
+  // Pi's default custom-message renderer inserts a blank line between the
+  // [cursor-agent] header and the content. Render it ourselves so the content
+  // appears on the line immediately following the header.
+  pi.registerMessageRenderer("cursor-agent", (message, _options, theme) => {
+    const label = theme.fg(
+      "customMessageLabel",
+      `\x1b[1m[${message.customType}]\x1b[22m`,
+    );
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : (message.content || [])
+            .filter((c) => c && c.type === "text")
+            .map((c) => c.text)
+            .join("\n");
+
+    const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+    box.addChild(new Text(label, 0, 0));
+    box.addChild(
+      new Markdown(text, 0, 0, getMarkdownTheme(), {
+        color: (t) => theme.fg("customMessageText", t),
+      }),
+    );
+    return box;
+  });
+
+  pi.on("session_start", (event, ctx) => {
+    if (event.reason !== "startup" && event.reason !== "reload") return;
+    const payload = startupLog;
+    if (!payload) return;
+
+    // session_start runs before Pi renders [Context]/[Skills]/[Extensions];
+    // defer to the next macrotask so messages appear after that header.
+    setTimeout(() => {
+      if ("error" in payload) {
+        if (ctx.hasUI) {
+          pi.sendMessage({ customType: "cursor-agent", content: `Failed to start: ${payload.error}`, display: true });
+        } else {
+          console.error(`[cursor-agent] Failed to start: ${payload.error}`);
+        }
+        return;
+      }
+      // Send all startup lines as a single message so consecutive lines render
+      // under one [cursor-agent] header instead of each line getting its own.
+      if (payload.lines.length === 0) return;
+      if (ctx.hasUI) {
+        pi.sendMessage({
+          customType: "cursor-agent",
+          content: payload.lines.join("\n"),
+          display: true,
+        });
+      } else {
+        for (const line of payload.lines) {
+          console.log(`[cursor-agent] ${line}`);
+        }
+      }
+    }, 0);
+  });
+}
+
+/**
+ * Fetch the OpenAI-style model list from a sibling proxy already
+ * running on the local port. Used in client-only mode so we don't
+ * spawn a second `cursor-agent models` process when another Pi
+ * instance has already populated its cache.
+ */
+async function fetchPeerModels() {
+  const payload = await fetchLocalJson("/v1/models", 2000);
+  if (!payload || !Array.isArray(payload.data)) {
+    throw new Error("peer /v1/models returned no data");
+  }
+  return payload.data;
+}
+
+function buildModelConfigs(models) {
+  return models
+    .filter((m) => m.id && !m.id.startsWith("_"))
+    .map((m) => ({
+      id: `${PROVIDER_ID}/${m.id}`,
+      name: m.name || m.id,
+      reasoning: /thinking|reasoning|high|xhigh/i.test(m.id),
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200000,
+      maxTokens: 16384,
+    }));
+}
+
+function registerCursorProvider(pi, modelConfigs) {
+  pi.registerProvider(PROVIDER_ID, {
+    name: "Cursor Agent",
+    baseUrl: `http://${HOST}:${PORT}/v1`,
+    apiKey: "PI_CURSOR_AGENT_API_KEY",
+    api: "openai-completions",
+    authHeader: false,
+    models: modelConfigs,
+    compat: {
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false,
+      maxTokensField: "max_tokens",
+      supportsUsageInStreaming: true,
+    },
+  });
+}
+
 export default async function (pi) {
-  if (process.env.CURSOR_ACP_DISABLE === "1") {
-    console.log("[cursor-acp] Disabled via CURSOR_ACP_DISABLE=1");
+  scheduleStartupLog(pi);
+
+  if (process.env.PI_CURSOR_AGENT_DISABLE === "1") {
+    startupLog = { lines: ["Disabled via PI_CURSOR_AGENT_DISABLE=1"] };
     return;
   }
 
-  let server = null;
+  // Close any server from a previous load so /reload re-binds the port with
+  // the latest handler code instead of silently reusing the stale server.
+  const PREV = globalThis.__piCursorAgentServer;
+  if (PREV) {
+    try { PREV.close(); } catch {}
+    globalThis.__piCursorAgentServer = null;
+  }
+
   let modelsCache = [];
   let modelsCacheTime = 0;
   const CACHE_TTL = 60_000;
@@ -411,7 +572,7 @@ export default async function (pi) {
       modelsCache = await fetchCursorModels();
       modelsCacheTime = Date.now();
     } catch (err) {
-      console.error("[cursor-acp] Failed to fetch models:", err.message);
+      console.error("[cursor-agent] Failed to fetch models:", err.message);
       if (modelsCache.length === 0) {
         modelsCache = FALLBACK_MODELS.map((id) => ({
           id,
@@ -424,56 +585,74 @@ export default async function (pi) {
     return modelsCache;
   }
 
+  /**
+   * Register against an already-running sibling proxy without binding
+   * the port ourselves. Lets multiple Pi instances share one proxy
+   * so the second/third instance still gets cursor-agent models in
+   * /model instead of failing with EADDRINUSE.
+   */
+  async function attachToExistingProxy(reason) {
+    try {
+      const peerModels = await fetchPeerModels();
+      const modelConfigs = buildModelConfigs(peerModels);
+      registerCursorProvider(pi, modelConfigs);
+      startupLog = {
+        lines: [
+          `Attached to existing proxy at http://${HOST}:${PORT}/v1 (${reason})`,
+          `Registered ${modelConfigs.length} models with Pi`,
+        ],
+      };
+      return true;
+    } catch (err) {
+      startupLog = { error: `Detected proxy on ${HOST}:${PORT} but failed to query it: ${err.message}` };
+      return false;
+    }
+  }
+
+  // Fast path: if another Pi instance already runs the proxy, attach to it
+  // instead of trying to bind the port (which would EADDRINUSE).
+  if (await detectExistingProxy()) {
+    await attachToExistingProxy("another Pi instance owns the port");
+    return;
+  }
+
   try {
-    server = startProxyServer(getModels);
+    const server = startProxyServer(getModels);
 
     await new Promise((resolve, reject) => {
-      server.listen(PORT, HOST, () => {
-        console.log(`[cursor-acp] Proxy server running on http://${HOST}:${PORT}/v1`);
+      const onListening = () => {
+        server.removeListener("error", onError);
+        globalThis.__piCursorAgentServer = server;
         resolve();
-      });
-      server.once("error", (err) => {
-        if (err.code === "EADDRINUSE") {
-          console.log(`[cursor-acp] Port ${PORT} already in use — reusing existing proxy`);
-          resolve();
-        } else {
-          reject(err);
-        }
-      });
+      };
+      const onError = (err) => {
+        server.removeListener("listening", onListening);
+        reject(err);
+      };
+      server.once("listening", onListening);
+      server.once("error", onError);
+      server.listen(PORT, HOST);
     });
 
     const models = await getModels();
+    const modelConfigs = buildModelConfigs(models);
+    registerCursorProvider(pi, modelConfigs);
 
-    const modelConfigs = models
-      .filter((m) => m.id && !m.id.startsWith("_"))
-      .map((m) => ({
-        id: `${PROVIDER_ID}/${m.id}`,
-        name: m.name || m.id,
-        reasoning: /thinking|reasoning|high|xhigh/i.test(m.id),
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 200000,
-        maxTokens: 16384,
-      }));
-
-    pi.registerProvider(PROVIDER_ID, {
-      name: "Cursor ACP",
-      baseUrl: `http://${HOST}:${PORT}/v1`,
-      apiKey: "CURSOR_ACP_API_KEY",
-      api: "openai-completions",
-      authHeader: false,
-      models: modelConfigs,
-      compat: {
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: false,
-        maxTokensField: "max_tokens",
-        supportsUsageInStreaming: true,
-      },
-    });
-
-    console.log(`[cursor-acp] Registered ${modelConfigs.length} models with Pi`);
+    startupLog = {
+      lines: [
+        `Proxy server running on http://${HOST}:${PORT}/v1`,
+        `Registered ${modelConfigs.length} models with Pi`,
+      ],
+    };
   } catch (err) {
-    console.error("[cursor-acp] Failed to start:", err.message);
+    // Race: another Pi instance bound the port between our probe and
+    // our listen(). Fall back to client-only mode so the user still
+    // gets cursor-agent models instead of a hard failure.
+    if (err && err.code === "EADDRINUSE" && (await detectExistingProxy())) {
+      await attachToExistingProxy("port became busy during startup");
+      return;
+    }
+    startupLog = { error: err.message };
   }
 }
 

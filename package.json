@@ -1,0 +1,33 @@
+{
+  "name": "pi-cursor-agent",
+  "version": "0.1.0",
+  "description": "Pi extension that exposes Cursor's cursor-agent CLI through a local OpenAI-compatible HTTP proxy and registers Cursor models with Pi.",
+  "keywords": [
+    "pi-extension",
+    "pi-package",
+    "cursor",
+    "cursor-agent",
+    "openai-compatible",
+    "proxy"
+  ],
+  "license": "MIT",
+  "author": "Eric Sison <eric@underactive.net>",
+  "type": "module",
+  "files": [
+    "extensions/",
+    "README.md",
+    "AGENTS.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

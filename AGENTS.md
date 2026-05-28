@@ -2,15 +2,20 @@
 
 ## Project Structure & Module Organization
 
-This repository contains a single Pi extension module:
+This repository is a publishable Pi extension package:
 
-- `cursor-acp.js` - starts an OpenAI-compatible local HTTP proxy for Cursor's `cursor-agent`, registers the `cursor-acp` provider with Pi, and exposes `/v1/models`, `/v1/chat/completions`, and `/health`.
+- `extensions/cursor-agent.js` - starts an OpenAI-compatible local HTTP proxy for Cursor's `cursor-agent`, registers the `cursor-agent` provider with Pi, and exposes `/v1/models`, `/v1/chat/completions`, and `/health`.
+- `package.json` - declares `pi.extensions: ["./extensions"]` so Pi auto-discovers the module when the package is installed via npm.
+- `LICENSE` - MIT.
+- `README.md` / `AGENTS.md` - user docs and contributor notes.
 
-There are no checked-in tests, assets, package manifests, or build artifacts. Keep new code close to the existing single-module layout unless the file becomes difficult to maintain; split helpers only when there is a clear boundary such as request parsing, Cursor CLI integration, or Pi provider registration.
+There are no checked-in tests or build artifacts. Keep new code close to the existing single-module layout unless the file becomes difficult to maintain; split helpers only when there is a clear boundary such as request parsing, Cursor CLI integration, or Pi provider registration. New source files should live under `extensions/` so they are picked up by Pi auto-discovery.
+
+Despite the historical `cursor-acp` name in early commits, this extension does **not** speak the Agent Client Protocol. It is an OpenAI Chat Completions–compatible HTTP proxy in front of the `cursor-agent` CLI.
 
 ## Build, Test, and Development Commands
 
-- `node --check cursor-acp.js` - validates JavaScript syntax without running the extension.
+- `node --check extensions/cursor-agent.js` - validates JavaScript syntax without running the extension.
 - `cursor-agent login` - authenticates the Cursor CLI before using the proxy.
 - `cursor-agent models --trust` - confirms the CLI can list models used by the provider.
 - In Pi, run `/reload` after editing the extension so Pi re-registers the provider.
@@ -23,12 +28,12 @@ Use modern JavaScript ES modules. Match the current style: two-space indentation
 
 ## Testing Guidelines
 
-No automated test framework is currently configured. For every change, run `node --check cursor-acp.js` and perform a Pi reload smoke test. When touching streaming or response formatting, test both streaming and non-streaming `/v1/chat/completions` requests because the code paths are separate. If you add tests later, place them under `test/` and name files after the behavior, for example `test/normalize-model.test.js`.
+No automated test framework is currently configured. For every change, run `node --check extensions/cursor-agent.js` and perform a Pi reload smoke test. When touching streaming or response formatting, test both streaming and non-streaming `/v1/chat/completions` requests because the code paths are separate. If you add tests later, place them under `test/` and name files after the behavior, for example `test/normalize-model.test.js`.
 
 ## Commit & Pull Request Guidelines
 
-This workspace does not include Git history, so use concise imperative commit messages such as `Handle cursor-agent spawn failures`. Pull requests should describe the behavior change, list manual verification commands, and call out any effects on environment variables, ports, or OpenAI API compatibility. Include screenshots only when Pi UI behavior changes.
+Use concise imperative commit messages such as `Handle cursor-agent spawn failures`. Pull requests should describe the behavior change, list manual verification commands, and call out any effects on environment variables, ports, or OpenAI API compatibility. Include screenshots only when Pi UI behavior changes.
 
 ## Security & Configuration Tips
 
-Do not commit credentials or local Cursor paths. Use `CURSOR_ACP_CURSOR_AGENT_PATH` for a custom CLI location and `CURSOR_ACP_DISABLE=1` to disable startup during troubleshooting. The proxy binds to `127.0.0.1:32124`; keep it local unless there is a deliberate security review.
+Do not commit credentials or local Cursor paths. Use `PI_CURSOR_AGENT_PATH` for a custom CLI location and `PI_CURSOR_AGENT_DISABLE=1` to disable startup during troubleshooting. The proxy binds to `127.0.0.1:32124`; keep it local unless there is a deliberate security review.
