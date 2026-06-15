@@ -123,7 +123,7 @@ function buildPromptFromMessages(messages) {
 
 function normalizeModel(modelId) {
   if (!modelId) return "auto";
-  return modelId.replace(/^cursor-agent\//, "");
+  return modelId.replace(/^cursor-agent\//, "").replace(/@[a-z0-9]+$/, "");
 }
 
 // ─── Model Family Detection ─────────────────────────────────────────────
@@ -153,8 +153,14 @@ const THINKING_SUFFIX = "-thinking";
 function parseModelId(modelId) {
   if (!modelId || modelId === "auto") return null;
 
-  // 1. Strip -fast suffix (orthogonal speed modifier, deferred)
+  // 0. Strip @ context suffix (Pi model ID convention, before any parsing)
   let id = modelId;
+  const contextSuffix = extractContextSuffix(id);
+  if (contextSuffix) {
+    id = stripContextSuffix(id);
+  }
+
+  // 1. Strip -fast suffix (orthogonal speed modifier, deferred)
   let isFast = false;
   if (id.endsWith("-fast")) {
     id = id.slice(0, -5);
@@ -850,6 +856,9 @@ function buildModelConfigs(models) {
                       || Object.keys(entry.thinkingVariants).length > 0;
     if (!hasVariants) continue;
 
+    const cw = MODEL_CONTEXT_WINDOWS[base] ?? FALLBACK_CONTEXT_WINDOW;
+    const mt = MAX_TOKENS_MAP[base] ?? DEFAULT_MAX_TOKENS;
+
     configs.push({
       id: `${PROVIDER_ID}/${base}`,
       name: base,
@@ -857,22 +866,56 @@ function buildModelConfigs(models) {
       thinkingLevelMap: buildThinkingLevelMap(entry),
       input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 200000,
-      maxTokens: 16384,
+      contextWindow: cw,
+      maxTokens: mt,
     });
+
+    // Register @ context variant for non-default context window
+    if (cw !== FALLBACK_CONTEXT_WINDOW) {
+      const suffix = contextWindowToSuffix(cw);
+      configs.push({
+        id: `${PROVIDER_ID}/${base}@${suffix}`,
+        name: `${base}@${suffix}`,
+        reasoning: true,
+        thinkingLevelMap: buildThinkingLevelMap(entry),
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: cw,
+        maxTokens: mt,
+      });
+    }
   }
 
   // Register standalone models (flat, non-reasoning entries)
   for (const id of standaloneModels) {
+    // Strip -fast suffix for map key lookup (fast variants share base values)
+    const mapKey = id.endsWith("-fast") ? id.slice(0, -5) : id;
+    const cw = MODEL_CONTEXT_WINDOWS[mapKey] ?? FALLBACK_CONTEXT_WINDOW;
+    const mt = MAX_TOKENS_MAP[mapKey] ?? DEFAULT_MAX_TOKENS;
+
     configs.push({
       id: `${PROVIDER_ID}/${id}`,
       name: id,
       reasoning: false,
       input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 200000,
-      maxTokens: 16384,
+      contextWindow: cw,
+      maxTokens: mt,
     });
+
+    // Register @ context variant for non-default context window
+    if (cw !== FALLBACK_CONTEXT_WINDOW) {
+      const suffix = contextWindowToSuffix(cw);
+      configs.push({
+        id: `${PROVIDER_ID}/${mapKey}@${suffix}`,
+        name: `${mapKey}@${suffix}`,
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: cw,
+        maxTokens: mt,
+      });
+    }
   }
 
   return configs;
@@ -914,7 +957,8 @@ export default async function (pi) {
   let modelsCache = [];
   let modelsCacheTime = 0;
   const CACHE_TTL = 60_000;
-  globalThis.__variantMap = {};  // populated alongside models
+  globalThis.__variantMap = {};          // populated alongside models
+  globalThis.__modelContextWindows = {};  // cached per-model context windows
 
   async function getModels() {
     if (modelsCache.length > 0 && Date.now() - modelsCacheTime < CACHE_TTL) {
@@ -924,6 +968,7 @@ export default async function (pi) {
       modelsCache = await fetchCursorModels();
       const { variantMap: vm } = buildModelFamilies(modelsCache);
       globalThis.__variantMap = vm;
+      globalThis.__modelContextWindows = buildModelContextWindows(modelsCache);
       modelsCacheTime = Date.now();
     } catch (err) {
       console.error("[cursor-agent] Failed to fetch models:", err.message);
@@ -937,6 +982,7 @@ export default async function (pi) {
         modelsCache = fallback;
         const { variantMap: vm } = buildModelFamilies(fallback);
         globalThis.__variantMap = vm;
+        globalThis.__modelContextWindows = buildModelContextWindows(fallback);
       }
     }
     return modelsCache;
@@ -1031,3 +1077,162 @@ const FALLBACK_MODELS = [
   "gemini-3.1-pro", "gemini-3-flash", "gemini-3.5-flash",
   "kimi-k2.5", "grok-4.3", "grok-build-0.1",
 ];
+
+// ─── Context window & max tokens maps ────────────────────────────────────────
+
+/**
+ * Default context window for models not in MODEL_CONTEXT_WINDOWS.
+ * Conservative: errs on early compaction rather than missed overflow.
+ */
+const FALLBACK_CONTEXT_WINDOW = 200000;
+
+/**
+ * Default max tokens for models not in MAX_TOKENS_MAP.
+ */
+const DEFAULT_MAX_TOKENS = 16384;
+
+/**
+ * Per-model context window values.
+ * Family-base keys cover all effort variants; standalone keys for raw IDs.
+ */
+const MODEL_CONTEXT_WINDOWS = {
+  // ── Claude families ──
+  "claude-opus-4-8": 1_000_000,
+  "claude-opus-4-7": 1_000_000,
+  "claude-opus-4-7-thinking": 1_000_000,
+  "claude-4.6-opus": 1_000_000,
+  "claude-4.6-sonnet": 1_000_000,
+  "claude-fable-5": 1_000_000,
+  "claude-4.5-opus": 200_000,
+  "claude-4.5-sonnet": 200_000,
+  "claude-4-sonnet": 200_000,
+  // ── GPT families ──
+  "gpt-5.5": 1_050_000,
+  "gpt-5.4": 1_050_000,
+  "gpt-5.4-mini": 1_050_000,
+  "gpt-5.4-nano": 1_050_000,
+  "gpt-5.3-codex": 400_000,
+  "gpt-5.1-codex-max": 400_000,
+  // ── Standalone models ──
+  "gemini-3.1-pro": 1_000_000,
+  "gemini-3-flash": 1_000_000,
+  "gemini-3.5-flash": 1_048_576,
+  "grok-4.3": 1_000_000,
+  "grok-build-0.1": 1_000_000,
+  "kimi-k2.5": 256_000,
+  "gpt-5.2": 400_000,
+  "gpt-5.2-codex": 400_000,
+  "gpt-5.1": 128_000,
+  "gpt-5.1-codex-mini": 400_000,
+  "gpt-5-mini": 400_000,
+  "composer-2": 200_000,
+  "composer-2.5": 200_000,
+  "auto": 200_000,
+};
+
+/**
+ * Per-model max tokens values.
+ * Derives all keys from MODEL_CONTEXT_WINDOWS with the default value.
+ */
+const MAX_TOKENS_MAP = Object.fromEntries(
+  Object.keys(MODEL_CONTEXT_WINDOWS).map(k => [k, DEFAULT_MAX_TOKENS])
+);
+
+// ─── @ context-suffix helpers ────────────────────────────────────────────────
+
+/**
+ * Convert a numeric context window to a human-readable suffix.
+ * @param {number} cw — context window value
+ * @returns {string} e.g. "1m", "400k"
+ */
+function contextWindowToSuffix(cw) {
+  if (cw >= 1_000_000) return "1m";
+  if (cw >= 500_000) return `${Math.round(cw / 1000)}k`;
+  return `${Math.round(cw / 1000)}k`;
+}
+
+/**
+ * Parse a context suffix like "1m" or "272k" into a numeric value.
+ * @param {string} suffix — context suffix (with or without leading @)
+ * @returns {number}
+ */
+function parseContextWindow(suffix) {
+  if (!suffix) return FALLBACK_CONTEXT_WINDOW;
+  const s = suffix.replace(/^@/, "");
+  const m = s.match(/^(\d+)([km])$/i);
+  if (!m) return FALLBACK_CONTEXT_WINDOW;
+  const num = parseInt(m[1], 10);
+  const unit = m[2].toLowerCase();
+  return unit === "m" ? num * 1_000_000 : num * 1_000;
+}
+
+/**
+ * Strip @ context suffix from a model ID.
+ * @param {string} modelId
+ * @returns {string}
+ */
+function stripContextSuffix(modelId) {
+  if (!modelId) return modelId;
+  return modelId.replace(/@[a-z0-9]+$/, "");
+}
+
+/**
+ * Extract the @ context suffix from a model ID.
+ * @param {string} modelId
+ * @returns {string|null} e.g. "@1m", "@272k", or null
+ */
+function extractContextSuffix(modelId) {
+  if (!modelId) return null;
+  const m = modelId.match(/@[a-z0-9]+$/);
+  return m ? m[0] : null;
+}
+
+// ─── Model context window cache builder ─────────────────────────────────────
+
+/**
+ * Build a cache mapping each model ID to its context window.
+ * Used for quick runtime lookup without re-parsing the model ID.
+ * @param {Array<{id: string}>} models — raw model objects from cursor-agent or FALLBACK_MODELS
+ * @returns {Record<string, number>}
+ */
+function buildModelContextWindows(models) {
+  const cwCache = {};
+  for (const m of models) {
+    const parsed = parseModelId(m.id);
+    let key;
+    if (parsed) {
+      key = parsed.base;
+    } else {
+      // Strip -fast for standalone model lookup (matches standalone loop in buildModelConfigs)
+      key = m.id.endsWith("-fast") ? m.id.slice(0, -5) : m.id;
+    }
+    cwCache[m.id] = MODEL_CONTEXT_WINDOWS[key] ?? FALLBACK_CONTEXT_WINDOW;
+  }
+  return cwCache;
+}
+
+/**
+ * Fallback context window map: maps every FALLBACK_MODELS ID to its
+ * context window, resolved through family-base or standalone key lookup.
+ * Ensures every fallback model ID has an accurate context window even
+ * when the live cursor-agent models fetch fails.
+ */
+const FALLBACK_MODEL_CONTEXT_WINDOWS = Object.fromEntries(
+  FALLBACK_MODELS.map(id => {
+    const parsed = parseModelId(id);
+    const key = parsed ? parsed.base : id;
+    return [id, MODEL_CONTEXT_WINDOWS[key] ?? FALLBACK_CONTEXT_WINDOW];
+  })
+);
+
+/**
+ * Fallback max tokens map: mirrors FALLBACK_MODEL_CONTEXT_WINDOWS keys.
+ * Ensures every fallback model ID has a max tokens value.
+ */
+const FALLBACK_MAX_TOKENS_MAP = Object.fromEntries(
+  Object.keys(FALLBACK_MODEL_CONTEXT_WINDOWS).map(id => {
+    const parsed = parseModelId(id);
+    const key = parsed ? parsed.base : id;
+    return [id, MAX_TOKENS_MAP[key] ?? DEFAULT_MAX_TOKENS];
+  })
+);

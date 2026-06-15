@@ -28,7 +28,9 @@
 
 ---
 
-## Phase 2 — Context window per model
+## Phase 2 — Context window per model ✅
+
+**Status:** Complete (2026-06-15) — implemented via #plan in `.rpiv/artifacts/plans/2026-06-15_10-14-37_phase-2-context-window-per-model.md`, validated in `.rpiv/artifacts/validation/2026-06-15_13-20-51_phase-2-context-window-per-model.md`.
 
 **Goal.** Replace the flat `contextWindow: 200000` with accurate values per model so Pi's context display, overflow checking, and compaction are correct.
 
@@ -159,7 +161,7 @@
 | Phase | Change | Effort | Impact |
 |-------|--------|--------|--------|
 | 1 | Thinking/reasoning mapping | Medium | High — users can control model reasoning in Pi | ✅ Complete |
-| 2 | Context window per model | Low | Medium — accurate context display and compaction |
+| 2 | Context window per model | Low | Medium — accurate context display and compaction | ✅ Complete |
 | 3 | Disk model cache | Low | Medium — faster startups |
 | 4 | `/cursor-refresh-models` | Low | Medium — no reload needed for new models |
 | 5 | Pi-native auth flow | Medium | High — no external CLI login step |
