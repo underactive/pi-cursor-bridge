@@ -51,7 +51,9 @@
 
 ---
 
-## Phase 3 — Disk model cache
+## Phase 3 — Disk model cache ✅
+
+**Status:** Complete (2026-06-15) — implemented via #plan in `.rpiv/artifacts/plans/2026-06-15_14-02-01_phase-3-disk-model-cache.md`, validated in `.rpiv/artifacts/validation/2026-06-15_15-08-50_phase-3-disk-model-cache.md`.
 
 **Goal.** Avoid spawning `cursor-agent models` on every Pi startup. Cache the model list to disk keyed by a hash of the Cursor auth state, with a configurable TTL.
 
@@ -62,6 +64,8 @@
 3. On successful CLI fetch, write the result to the cache file.
 4. Honor `PI_CURSOR_MODEL_CACHE_TTL_MS` env var (default `86400000` — 24h) and `PI_CURSOR_DISABLE_MODEL_CACHE=1` to bypass.
 5. Keep the in-memory cache as a hot-path front; disk cache is the cold-start fallback.
+6. Peer-attach path falls back to disk cache when `fetchPeerModels()` fails.
+7. Startup log shows cache origin: disk, cli-cached, stale-disk, or fallback.
 
 **Success criteria.**
 
@@ -70,7 +74,7 @@
 - `PI_CURSOR_DISABLE_MODEL_CACHE=1`: ignores disk cache every time.
 - Warm startups complete in <100ms for model discovery.
 
-**Files touched.** `extensions/cursor-agent.js` — new `CACHE_DIR`, `loadModelCache()`, `saveModelCache()` functions, modified `getModels()`.
+**Files touched.** `extensions/cursor-agent.js` — new cache infrastructure (`loadModelCache`, `saveModelCache`, `getAuthHash`, etc.), modified `getModels()` with disk read/write, peer-attach fallback, startup logging.
 
 ---
 
@@ -162,7 +166,7 @@
 |-------|--------|--------|--------|
 | 1 | Thinking/reasoning mapping | Medium | High — users can control model reasoning in Pi | ✅ Complete |
 | 2 | Context window per model | Low | Medium — accurate context display and compaction | ✅ Complete |
-| 3 | Disk model cache | Low | Medium — faster startups |
+| 3 | Disk model cache | Low | Medium — faster startups | ✅ Complete |
 | 4 | `/cursor-refresh-models` | Low | Medium — no reload needed for new models |
 | 5 | Pi-native auth flow | Medium | High — no external CLI login step |
 | 6 | Image input | Low | Medium — image support in chat |

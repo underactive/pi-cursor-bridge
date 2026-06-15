@@ -19,6 +19,7 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 
@@ -51,6 +52,191 @@ function resolveCursorAgent() {
 
 function cursorAgentPath() {
   return process.env.PI_CURSOR_AGENT_PATH || resolveCursorAgent();
+}
+
+// ─── Cache Infrastructure ────────────────────────────────────────────────
+
+/**
+ * Default TTL for the disk model cache (24 hours in ms).
+ */
+const DEFAULT_CACHE_TTL_MS = 86_400_000;
+
+/**
+ * Cache file format version. Bump if the on-disk schema changes.
+ */
+const CACHE_FORMAT_VERSION = 1;
+
+/**
+ * Whether the disk model cache is disabled.
+ */
+const DISABLE_MODEL_CACHE = process.env.PI_CURSOR_DISABLE_MODEL_CACHE === "1";
+
+/**
+ * Resolve the cache TTL from env var or default (24h).
+ */
+function getCacheTTL() {
+  const env = process.env.PI_CURSOR_MODEL_CACHE_TTL_MS;
+  if (env) {
+    const n = parseInt(env, 10);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  return DEFAULT_CACHE_TTL_MS;
+}
+
+/**
+ * Resolve the cache file path: ~/.pi/agent/cursor-agent-model-cache.json
+ */
+function getCacheFilePath() {
+  const home = process.env.HOME || process.env.USERPROFILE || "/tmp";
+  return path.join(home, ".pi", "agent", "cursor-agent-model-cache.json");
+}
+
+/**
+ * Read Cursor auth state and return a SHA-256 hex hash.
+ *
+ * Sources (in priority order):
+ *   1. CURSOR_API_KEY env var
+ *   2. ~/.cursor/cli-config.json (authInfo + serverConfigCache)
+ *   3. Unauthenticated sentinel
+ *
+ * @returns {string} hex-encoded SHA-256 hash
+ */
+function getAuthHash() {
+  const apiKey = process.env.CURSOR_API_KEY;
+  if (apiKey) {
+    return crypto.createHash("sha256").update(`apikey:${apiKey}`).digest("hex");
+  }
+
+  try {
+    const cliConfigPath = path.join(
+      process.env.HOME || process.env.USERPROFILE || "/tmp",
+      ".cursor",
+      "cli-config.json"
+    );
+    const cliConfig = JSON.parse(fs.readFileSync(cliConfigPath, "utf8"));
+    const authInfo = cliConfig.authInfo || {};
+    const serverConfig = cliConfig.serverConfigCache || {};
+    const input = JSON.stringify(authInfo) + "|" + JSON.stringify(serverConfig);
+    return crypto.createHash("sha256").update(input).digest("hex");
+  } catch {
+    // No ~/.cursor/cli-config.json or parse error — use sentinel
+    return crypto.createHash("sha256").update("unauthenticated").digest("hex");
+  }
+}
+
+/**
+ * Load model cache from disk.
+ *
+ * Reads the cache file, finds the entry for the current auth hash,
+ * and returns it if valid. When allowStale is false (default), returns
+ * null for expired entries (beyond TTL). When allowStale is true, returns
+ * the cached entry regardless of age — useful for CLI-fallback when the
+ * primary fetch fails.
+ *
+ * Returns null on any other failure (missing file, corrupt JSON,
+ * no matching entry).
+ *
+ * @param {{ allowStale?: boolean }} [options]
+ * @returns {{ models: Array, cachedAt: number } | null}
+ */
+function loadModelCache(options = {}) {
+  if (DISABLE_MODEL_CACHE) return null;
+
+  let raw;
+  try {
+    raw = fs.readFileSync(getCacheFilePath(), "utf8");
+  } catch {
+    return null; // ENOENT or permission error — no cache
+  }
+
+  let cache;
+  try {
+    cache = JSON.parse(raw);
+  } catch {
+    // Corrupt cache file — delete it to prevent repeat errors
+    try { fs.unlinkSync(getCacheFilePath()); } catch {}
+    return null;
+  }
+
+  if (!cache || cache.formatVersion !== CACHE_FORMAT_VERSION) return null;
+
+  const authHash = getAuthHash();
+  const entry = cache.entries?.[authHash];
+  if (!entry || !Array.isArray(entry.models)) return null;
+
+  const ttl = getCacheTTL();
+  const age = Date.now() - entry.cachedAt;
+  if (!options.allowStale && age > ttl) return null;
+
+  return { models: entry.models, cachedAt: entry.cachedAt };
+}
+
+/**
+ * Save model cache to disk.
+ *
+ * Reads existing cache, updates the entry for the current auth hash,
+ * purges stale entries, and writes back. Fire-and-forget — caller
+ * should not await.
+ *
+ * @param {Array<{ id: string, name?: string, object?: string, owned_by?: string }>} models
+ * @param {string} [cliVersion] — cursor-agent CLI version string (for debugging)
+ * @returns {Promise<void>}
+ */
+async function saveModelCache(models, cliVersion) {
+  if (DISABLE_MODEL_CACHE || !Array.isArray(models) || models.length === 0) return;
+
+  const filePath = getCacheFilePath();
+  const authHash = getAuthHash();
+  const ttl = getCacheTTL();
+
+  // Read existing cache (ignore errors — we'll create from scratch)
+  let cache;
+  try {
+    cache = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    cache = { formatVersion: CACHE_FORMAT_VERSION, entries: {} };
+  }
+
+  if (!cache.entries) cache.entries = {};
+  if (!cache.formatVersion) cache.formatVersion = CACHE_FORMAT_VERSION;
+
+  // Update entry for current auth
+  cache.entries[authHash] = {
+    cachedAt: Date.now(),
+    cliVersion: cliVersion || "",
+    models: models.map(m => ({
+      id: m.id,
+      name: m.name || m.id,
+      object: m.object || "model",
+      owned_by: m.owned_by || "cursor",
+    })),
+  };
+
+  // Purge entries older than 2x TTL to prevent unbounded growth
+  const cutoff = Date.now() - 2 * ttl;
+  for (const hash of Object.keys(cache.entries)) {
+    if (cache.entries[hash].cachedAt < cutoff) {
+      delete cache.entries[hash];
+    }
+  }
+
+  // Ensure directory exists
+  try {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  } catch {}
+
+  // Write atomically via temp file
+  const tmpPath = filePath + ".tmp";
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(cache, null, 2), "utf8");
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch {}
+    console.error("[cursor-agent] Failed to write model cache:", err.message);
+  }
 }
 
 /**
@@ -956,11 +1142,29 @@ export default async function (pi) {
 
   let modelsCache = [];
   let modelsCacheTime = 0;
+  let modelsCacheOrigin = null; // "disk" | "cli" | "stale-disk" | "fallback"
   const CACHE_TTL = 60_000;
   globalThis.__variantMap = {};          // populated alongside models
   globalThis.__modelContextWindows = {};  // cached per-model context windows
 
   async function getModels() {
+    // Disk cache read: only on first call per extension lifecycle
+    if (modelsCache.length === 0 && !DISABLE_MODEL_CACHE) {
+      const diskEntry = loadModelCache();
+      if (diskEntry) {
+        modelsCache = diskEntry.models.map(m => ({
+          ...m,
+          created: Math.floor(Date.now() / 1000),
+        }));
+        const { variantMap: vm } = buildModelFamilies(modelsCache);
+        globalThis.__variantMap = vm;
+        globalThis.__modelContextWindows = buildModelContextWindows(modelsCache);
+        modelsCacheTime = Date.now(); // reset so in-memory 60s TTL protects this session
+        modelsCacheOrigin = "disk";
+        return modelsCache;
+      }
+    }
+
     if (modelsCache.length > 0 && Date.now() - modelsCacheTime < CACHE_TTL) {
       return modelsCache;
     }
@@ -970,9 +1174,30 @@ export default async function (pi) {
       globalThis.__variantMap = vm;
       globalThis.__modelContextWindows = buildModelContextWindows(modelsCache);
       modelsCacheTime = Date.now();
+      // Fire-and-forget: cache to disk after successful CLI fetch
+      if (!DISABLE_MODEL_CACHE) {
+        modelsCacheOrigin = "cli";
+        saveModelCache(modelsCache).catch(() => {});
+      }
     } catch (err) {
       console.error("[cursor-agent] Failed to fetch models:", err.message);
       if (modelsCache.length === 0) {
+        // Try stale disk cache before falling back to FALLBACK_MODELS
+        if (!DISABLE_MODEL_CACHE) {
+          const staleEntry = loadModelCache({ allowStale: true });
+          if (staleEntry) {
+            modelsCache = staleEntry.models.map(m => ({
+              ...m,
+              created: Math.floor(Date.now() / 1000),
+            }));
+            const { variantMap: vm } = buildModelFamilies(modelsCache);
+            globalThis.__variantMap = vm;
+            globalThis.__modelContextWindows = buildModelContextWindows(modelsCache);
+            modelsCacheTime = staleEntry.cachedAt;
+            modelsCacheOrigin = "stale-disk";
+            return modelsCache;
+          }
+        }
         const fallback = FALLBACK_MODELS.map((id) => ({
           id,
           object: "model",
@@ -983,6 +1208,7 @@ export default async function (pi) {
         const { variantMap: vm } = buildModelFamilies(fallback);
         globalThis.__variantMap = vm;
         globalThis.__modelContextWindows = buildModelContextWindows(fallback);
+        modelsCacheOrigin = "fallback";
       }
     }
     return modelsCache;
@@ -1007,6 +1233,26 @@ export default async function (pi) {
       };
       return true;
     } catch (err) {
+      // Try disk cache as fallback when peer models unavailable
+      if (!DISABLE_MODEL_CACHE) {
+        const diskEntry = loadModelCache({ allowStale: true });
+        if (diskEntry) {
+          const models = diskEntry.models.map(m => ({
+            ...m,
+            created: Math.floor(Date.now() / 1000),
+          }));
+          const modelConfigs = buildModelConfigs(models);
+          registerCursorProvider(pi, modelConfigs);
+          startupLog = {
+            lines: [
+              `Attached to existing proxy at http://${HOST}:${PORT}/v1 (${reason})`,
+              `Registered ${modelConfigs.length} models with Pi`,
+              `Loaded ${modelConfigs.length} models from disk cache (peer models unavailable)`,
+            ],
+          };
+          return true;
+        }
+      }
       startupLog = { error: `Detected proxy on ${HOST}:${PORT} but failed to query it: ${err.message}` };
       return false;
     }
@@ -1041,12 +1287,22 @@ export default async function (pi) {
     const modelConfigs = buildModelConfigs(models);
     registerCursorProvider(pi, modelConfigs);
 
-    startupLog = {
-      lines: [
-        `Proxy server running on http://${HOST}:${PORT}/v1`,
-        `Registered ${modelConfigs.length} models with Pi`,
-      ],
-    };
+    const logLines = [
+      `Proxy server running on http://${HOST}:${PORT}/v1`,
+      `Registered ${modelConfigs.length} models with Pi`,
+    ];
+    if (modelsCacheOrigin === "disk") {
+      logLines.push(`Loaded ${models.length} models from disk cache`);
+    } else if (modelsCacheOrigin === "cli") {
+      if (!DISABLE_MODEL_CACHE) {
+        logLines.push(`Discovered ${models.length} models via cursor-agent CLI, cached to disk`);
+      }
+    } else if (modelsCacheOrigin === "stale-disk") {
+      logLines.push(`Loaded ${models.length} models from stale disk cache (CLI unavailable)`);
+    } else if (modelsCacheOrigin === "fallback") {
+      logLines.push(`Using built-in fallback list (${models.length} models) \u2014 CLI unavailable`);
+    }
+    startupLog = { lines: logLines };
   } catch (err) {
     // Race: another Pi instance bound the port between our probe and
     // our listen(). Fall back to client-only mode so the user still
