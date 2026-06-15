@@ -531,7 +531,7 @@ function registerCursorProvider(pi, modelConfigs) {
   pi.registerProvider(PROVIDER_ID, {
     name: "Cursor Agent",
     baseUrl: `http://${HOST}:${PORT}/v1`,
-    apiKey: "PI_CURSOR_AGENT_API_KEY",
+    apiKey: "$PI_CURSOR_AGENT_API_KEY",
     api: "openai-completions",
     authHeader: false,
     models: modelConfigs,
