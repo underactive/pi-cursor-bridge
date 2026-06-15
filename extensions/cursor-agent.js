@@ -126,6 +126,241 @@ function normalizeModel(modelId) {
   return modelId.replace(/^cursor-agent\//, "");
 }
 
+// ─── Model Family Detection ─────────────────────────────────────────────
+
+/**
+ * Known effort level tokens, ordered longest-first for greedy matching.
+ * These appear as suffixes in cursor-agent model IDs.
+ */
+const EFFORT_TOKENS = ["extra-high", "xhigh", "medium", "high", "low", "none", "max"];
+
+/**
+ * Suffix string appended to an effort-tier model to indicate a thinking variant,
+ * e.g. `claude-4.6-sonnet-medium-thinking`.
+ */
+const THINKING_SUFFIX = "-thinking";
+
+/**
+ * Parse a raw cursor-agent model ID into its constituent parts.
+ *
+ * Returns `null` for models that cannot be parsed (no effort token detected),
+ * UNLESS the model is a boolean-thinking variant (e.g. `claude-4.5-sonnet-thinking`)
+ * where the `-thinking` suffix alone signals the thinking variant.
+ *
+ * @param {string} modelId — raw model ID from cursor-agent (e.g. "gpt-5.5-high")
+ * @returns {{ base: string, effort: string|null, isThinking: boolean, isFast: boolean, originalModelId: string } | null}
+ */
+function parseModelId(modelId) {
+  if (!modelId || modelId === "auto") return null;
+
+  // 1. Strip -fast suffix (orthogonal speed modifier, deferred)
+  let id = modelId;
+  let isFast = false;
+  if (id.endsWith("-fast")) {
+    id = id.slice(0, -5);
+    isFast = true;
+  }
+
+  // 2. Detect -thinking suffix (thinking variant appended to an effort tier)
+  let hasThinkingSuffix = false;
+  if (id.endsWith(THINKING_SUFFIX)) {
+    hasThinkingSuffix = true;
+    id = id.slice(0, -THINKING_SUFFIX.length);
+  }
+
+  // 3. Try to match an effort token from the right
+  for (const token of EFFORT_TOKENS) {
+    const suffix = `-${token}`;
+    if (id.endsWith(suffix)) {
+      const base = id.slice(0, -suffix.length);
+      if (!base) continue;
+
+      // 4. Detect thinking infix/suffix in the base.
+      //    -thinking- (with trailing dash): e.g. "claude-opus-4-7-thinking-high"
+      //    -thinking at end: effort was stripped after thinking infix
+      let baseName = base;
+      let isThinkingInfix = false;
+
+      const thinkingInfixPattern = "-thinking-";
+      const tiIdx = base.lastIndexOf(thinkingInfixPattern);
+      if (tiIdx !== -1) {
+        baseName = base.slice(0, tiIdx);
+        isThinkingInfix = true;
+      } else {
+        const thinkingSuffixOnBase = "-thinking";
+        if (base.endsWith(thinkingSuffixOnBase) && base.length > thinkingSuffixOnBase.length) {
+          const tsIdx = base.lastIndexOf(thinkingSuffixOnBase);
+          const beforeThinking = base.slice(0, tsIdx);
+          if (beforeThinking && beforeThinking.length > 0 && beforeThinking.includes("-")) {
+            baseName = beforeThinking;
+            isThinkingInfix = true;
+          }
+        }
+      }
+
+      const family = isThinkingInfix ? `${baseName}-thinking` : baseName;
+
+      return {
+        base: family,
+        effort: token,
+        isThinking: isThinkingInfix || hasThinkingSuffix,
+        originalModelId: modelId,
+        isFast,
+      };
+    }
+  }
+
+  // 5. Boolean-thinking model: -thinking suffix, no effort token
+  //    e.g. "claude-4.5-sonnet-thinking"
+  if (hasThinkingSuffix && id) {
+    if (id.indexOf("-") !== -1 || /^[a-z]/.test(id)) {
+      return {
+        base: id,
+        effort: null,
+        isThinking: true,
+        originalModelId: modelId,
+        isFast,
+      };
+    }
+  }
+
+  // No effort token found — standalone model
+  return null;
+}
+
+/**
+ * Group raw cursor-agent model objects into families and build the variant map.
+ *
+ * @param {Array<{ id: string }>} models — raw model objects from fetchCursorModels()
+ * @returns {{ families: Map<string, object>, variantMap: object, standaloneModels: string[] }}
+ */
+function buildModelFamilies(models) {
+  const families = new Map();
+  const variantMap = {};
+  const standaloneSet = new Set();
+  let standaloneModels = [];
+
+  // Phase 1: Parse each model and group into families
+  for (const m of models) {
+    if (!m.id || m.id.startsWith("_")) continue;
+    const parsed = parseModelId(m.id);
+    if (!parsed) { standaloneSet.add(m.id); continue; }
+
+    const { base, effort, isThinking, originalModelId } = parsed;
+
+    if (!families.has(base)) {
+      families.set(base, {
+        variants: {},
+        thinkingVariants: {},
+        booleanThinkingVariant: null,
+        hasNonThinking: false,
+      });
+    }
+
+    const family = families.get(base);
+    if (isThinking && effort === null) {
+      family.booleanThinkingVariant = originalModelId;
+    } else if (isThinking) {
+      family.thinkingVariants[effort] = originalModelId;
+    } else {
+      family.variants[effort] = originalModelId;
+      family.hasNonThinking = true;
+    }
+  }
+
+  // Phase 2: Build variantMap from families
+  for (const [base, family] of families) {
+    const entry = { variants: {}, thinkingVariants: {}, defaultVariant: null };
+    Object.assign(entry.variants, family.variants);
+    Object.assign(entry.thinkingVariants, family.thinkingVariants);
+
+    if (family.booleanThinkingVariant) {
+      entry.thinkingVariants.on = family.booleanThinkingVariant;
+    }
+
+    const vKeys = Object.keys(entry.variants);
+    const tKeys = Object.keys(entry.thinkingVariants);
+
+    if (entry.variants.medium) entry.defaultVariant = entry.variants.medium;
+    else if (entry.variants.high) entry.defaultVariant = entry.variants.high;
+    else if (vKeys.length > 0) entry.defaultVariant = entry.variants[vKeys[0]];
+    else if (tKeys.length > 0) entry.defaultVariant = entry.thinkingVariants[tKeys[0]];
+
+    if (vKeys.length > 0 || tKeys.length > 0) {
+      variantMap[base] = entry;
+    } else {
+      standaloneSet.add(base);
+    }
+  }
+
+  // Phase 3: Link standalone models that match family base names
+  //          and resolve boolean-thinking linking.
+  standaloneModels = [...standaloneSet];
+  for (const [base, family] of families) {
+    const entry = variantMap[base];
+    if (!entry) continue;
+
+    // If a standalone model shares the base name, link it into the family
+    const ntIdx = standaloneModels.indexOf(base);
+    if (ntIdx !== -1) {
+      entry.variants.off = base;
+      entry.defaultVariant = base;
+      standaloneModels.splice(ntIdx, 1);
+    }
+
+    // Boolean-thinking models with no standalone base get custom linking
+    if (family.booleanThinkingVariant && family.hasNonThinking === false && !entry.variants.off) {
+      // No stand-alone base model — the thinking variant is the only member.
+      // Keep the current default (thinking variant) but flag it as "on" only.
+    }
+  }
+
+  return { families, variantMap, standaloneModels };
+}
+
+/**
+ * Determine if a model has a family that supports reasoning.
+ */
+function supportsReasoning(modelId, familyData) {
+  const parsed = parseModelId(modelId);
+  if (parsed && familyData.variantMap[parsed.base]) {
+    const entry = familyData.variantMap[parsed.base];
+    return Object.keys(entry.variants).length >= 1 || Object.keys(entry.thinkingVariants).length >= 1;
+  }
+  return false;
+}
+
+/**
+ * Resolve the effective cursor-agent model ID given a collapsed family ID
+ * and an optional reasoning_effort value from the request body.
+ *
+ * @param {string} familyId — collapsed base model ID (without variant suffix)
+ * @param {string|undefined} reasoningEffort — reasoning_effort from request body
+ * @param {object} variantMap — from buildModelFamilies()
+ * @returns {string|null} — resolved model ID, or null if no match
+ */
+function resolveModelVariant(familyId, reasoningEffort, variantMap) {
+  const entry = variantMap[familyId];
+  if (!entry) return null;
+
+  // No reasoning_effort or "off": use default non-thinking variant
+  if (!reasoningEffort || reasoningEffort === "off") {
+    return entry.defaultVariant || null;
+  }
+
+  // reasoning_effort present and not "off": try thinking variant first
+  if (entry.thinkingVariants[reasoningEffort]) {
+    return entry.thinkingVariants[reasoningEffort];
+  }
+
+  // Fall back to non-thinking variant at this effort
+  if (entry.variants[reasoningEffort]) {
+    return entry.variants[reasoningEffort];
+  }
+
+  return null;
+}
+
 /**
  * Parse common cursor-agent errors into user-friendly messages.
  */
@@ -161,14 +396,24 @@ function handleChatCompletions(req, res) {
       return;
     }
 
-    const { messages, stream, model } = requestBody;
+    const { messages, stream, model, reasoning_effort } = requestBody;
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "messages is required" }));
       return;
     }
 
-    const cursorModel = normalizeModel(model);
+    let cursorModel = normalizeModel(model);
+
+    // If a reasoning_effort is provided and we have a variant map,
+    // attempt model ID substitution for collapsed families.
+    if (reasoning_effort !== undefined && typeof __variantMap !== "undefined") {
+      // normalizeModel strips cursor-agent/ prefix, so cursorModel is the raw ID
+      const resolved = resolveModelVariant(cursorModel, reasoning_effort, __variantMap);
+      if (resolved) {
+        cursorModel = resolved;
+      }
+    }
     const prompt = buildPromptFromMessages(messages);
     const id = `cursor-agent-${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
@@ -227,7 +472,17 @@ function handleChatCompletions(req, res) {
       };
 
       const handleStreamEvent = (event) => {
-        if (event.type === "thinking") return;
+        if (event.type === "thinking") {
+          // Forward thinking content as reasoning_content delta
+          const content = event.content || event.text || "";
+          if (content) {
+            res.write(`data: ${JSON.stringify({
+              id, object: "chat.completion.chunk", created, model: cursorModel,
+              choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }]
+            })}\n\n`);
+          }
+          return;
+        }
 
         if (event.type === "tool_call") {
           assembledText = "";
@@ -298,12 +553,17 @@ function handleChatCompletions(req, res) {
 
       child.on("close", (code) => {
         let assistantText = "";
+        let thinkingText = "";  // accumulate thinking content
         let errorText = "";
         let usage = null;
 
         for (const line of stdout.trim().split("\n")) {
           try {
             const event = JSON.parse(line.trim());
+            if (event.type === "thinking") {
+              // Accumulate thinking content
+              thinkingText += (event.content || event.text || "");
+            }
             if (event.type === "assistant" && event.message?.content) {
               for (const block of event.message.content) {
                 if (block.type === "text") assistantText = block.text;
@@ -322,15 +582,33 @@ function handleChatCompletions(req, res) {
           errorText = formatCursorError(stderr.trim());
         }
 
+        // Include thinking content in the response
+        const responseMessage = {
+          role: "assistant",
+          content: errorText || assistantText || "No response",
+        };
+        if (thinkingText) {
+          responseMessage.reasoning_text = thinkingText;
+        }
+
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
+        const responsePayload = {
           id,
           object: "chat.completion",
           created,
           model: cursorModel,
-          choices: [{ index: 0, message: { role: "assistant", content: errorText || assistantText || "No response" }, finish_reason: errorText ? "error" : "stop" }],
-          usage: usage ? { prompt_tokens: usage.inputTokens ?? 0, completion_tokens: usage.outputTokens ?? 0, total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0) } : undefined,
-        }));
+          choices: [{ index: 0, message: responseMessage, finish_reason: errorText ? "error" : "stop" }],
+        };
+        if (usage) {
+          responsePayload.usage = {
+            prompt_tokens: usage.inputTokens ?? 0,
+            completion_tokens: usage.outputTokens ?? 0,
+            total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+            cache_read_tokens: usage.cacheReadTokens ?? 0,
+            cache_write_tokens: usage.cacheWriteTokens ?? 0,
+          };
+        }
+        res.end(JSON.stringify(responsePayload));
       });
 
       child.on("error", (err) => {
@@ -514,17 +792,90 @@ async function fetchPeerModels() {
 }
 
 function buildModelConfigs(models) {
-  return models
-    .filter((m) => m.id && !m.id.startsWith("_"))
-    .map((m) => ({
-      id: `${PROVIDER_ID}/${m.id}`,
-      name: m.name || m.id,
-      reasoning: /thinking|reasoning|high|xhigh/i.test(m.id),
+  const { variantMap, standaloneModels } = buildModelFamilies(models);
+
+  /**
+   * Build a thinkingLevelMap for a family.
+   * Maps Pi thinking levels to effort tokens that resolveModelVariant understands.
+   */
+  function buildThinkingLevelMap(familyEntry) {
+    const vKeys = Object.keys(familyEntry.variants);
+    const tvKeys = Object.keys(familyEntry.thinkingVariants);
+
+    const map = {
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: null,
+      xhigh: null,
+    };
+
+    // Map non-thinking variants: Pi level → effort token
+    if (vKeys.includes("low")) map.low = "low";
+    if (vKeys.includes("medium")) map.medium = "medium";
+    if (vKeys.includes("high")) map.high = "high";
+    if (vKeys.includes("xhigh")) map.xhigh = "xhigh";
+    // Map extra-high → Pi's xhigh
+    if (vKeys.includes("extra-high")) map.xhigh = "extra-high";
+    if (vKeys.includes("max")) map.xhigh = "max";
+    if (vKeys.includes("none")) map.off = "none";
+
+    // Map thinking variants: if a thinking variant exists at a level,
+    // override the non-thinking mapping (thinking wins for active thinking)
+    if (tvKeys.includes("low")) map.low = "low";
+    if (tvKeys.includes("medium")) map.medium = "medium";
+    if (tvKeys.includes("high")) map.high = "high";
+    if (tvKeys.includes("xhigh")) map.xhigh = "xhigh";
+    if (tvKeys.includes("on")) {
+      // Boolean thinking: map all non-null thinking levels to "on"
+      for (const level of ["low", "medium", "high", "xhigh"]) {
+        if (map[level] !== null) map[level] = "on";
+      }
+      // If no levels mapped yet, map medium and high to "on"
+      if (!Object.values(map).some(v => v === "on")) {
+        map.medium = "on";
+        map.high = "on";
+      }
+    }
+
+    return map;
+  }
+
+  const configs = [];
+
+  // Register collapsed families
+  for (const [base, entry] of Object.entries(variantMap)) {
+    const hasVariants = Object.keys(entry.variants).length > 0
+                      || Object.keys(entry.thinkingVariants).length > 0;
+    if (!hasVariants) continue;
+
+    configs.push({
+      id: `${PROVIDER_ID}/${base}`,
+      name: base,
+      reasoning: true,
+      thinkingLevelMap: buildThinkingLevelMap(entry),
       input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 200000,
       maxTokens: 16384,
-    }));
+    });
+  }
+
+  // Register standalone models (flat, non-reasoning entries)
+  for (const id of standaloneModels) {
+    configs.push({
+      id: `${PROVIDER_ID}/${id}`,
+      name: id,
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200000,
+      maxTokens: 16384,
+    });
+  }
+
+  return configs;
 }
 
 function registerCursorProvider(pi, modelConfigs) {
@@ -536,8 +887,8 @@ function registerCursorProvider(pi, modelConfigs) {
     authHeader: false,
     models: modelConfigs,
     compat: {
-      supportsDeveloperRole: false,
-      supportsReasoningEffort: false,
+      supportsDeveloperRole: true,
+      supportsReasoningEffort: true,
       maxTokensField: "max_tokens",
       supportsUsageInStreaming: true,
     },
@@ -563,6 +914,7 @@ export default async function (pi) {
   let modelsCache = [];
   let modelsCacheTime = 0;
   const CACHE_TTL = 60_000;
+  globalThis.__variantMap = {};  // populated alongside models
 
   async function getModels() {
     if (modelsCache.length > 0 && Date.now() - modelsCacheTime < CACHE_TTL) {
@@ -570,16 +922,21 @@ export default async function (pi) {
     }
     try {
       modelsCache = await fetchCursorModels();
+      const { variantMap: vm } = buildModelFamilies(modelsCache);
+      globalThis.__variantMap = vm;
       modelsCacheTime = Date.now();
     } catch (err) {
       console.error("[cursor-agent] Failed to fetch models:", err.message);
       if (modelsCache.length === 0) {
-        modelsCache = FALLBACK_MODELS.map((id) => ({
+        const fallback = FALLBACK_MODELS.map((id) => ({
           id,
           object: "model",
           created: Math.floor(Date.now() / 1000),
           owned_by: "cursor",
         }));
+        modelsCache = fallback;
+        const { variantMap: vm } = buildModelFamilies(fallback);
+        globalThis.__variantMap = vm;
       }
     }
     return modelsCache;
