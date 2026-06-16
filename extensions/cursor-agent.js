@@ -22,6 +22,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { SessionManager, buildSessionPrompt } from "./cursor-session.js";
 
 // ─── Config ───────────────────────────────────────────────────────────
 
@@ -64,7 +65,7 @@ const DEFAULT_CACHE_TTL_MS = 86_400_000;
 /**
  * Cache file format version. Bump if the on-disk schema changes.
  */
-const CACHE_FORMAT_VERSION = 1;
+const CACHE_FORMAT_VERSION = 2;
 
 /**
  * Whether the disk model cache is disabled.
@@ -207,6 +208,8 @@ async function saveModelCache(models, cliVersion) {
     models: models.map(m => ({
       id: m.id,
       name: m.name || m.id,
+      contextWindow: m.contextWindow ?? null,
+      maxTokens: m.maxTokens ?? null,
       object: m.object || "model",
       owned_by: m.owned_by || "cursor",
     })),
@@ -240,7 +243,40 @@ async function saveModelCache(models, cliVersion) {
 }
 
 /**
- * Run cursor-agent in "list models" mode.
+ * Parse a context window size from a cursor-agent model display name.
+ *
+ * Display names include context annotations like "1M", "400K", or omit
+ * them for the default 200K. Examples:
+ *   "Opus 4.8 1M" → 1_000_000
+ *   "GPT-5.5 1M High" → 1_050_000
+ *   "Sonnet 4.6 1M" → 1_000_000
+ *   "Codex 5.3 Low" → 400_000 (no annotation = ~200K default, but family has 400K)
+ *
+ * When the display name contains an explicit "N<unit>" token, parse it.
+ * Otherwise return null so the caller can fall back to the static map.
+ *
+ * @param {string} displayName — the human-readable model name (second column from --list-models)
+ * @returns {number|null} — context window or null if no annotation found
+ */
+function parseContextFromDisplayName(displayName) {
+  if (!displayName) return null;
+  // Match patterns like "1M", "400K" (case-insensitive) as standalone tokens
+  const m = displayName.match(/(\d+)([kKmM])\b/);
+  if (!m) return null;
+  const num = parseInt(m[1], 10);
+  const unit = m[2].toLowerCase();
+  if (unit === "m") {
+    return num * 1_000_000;
+  }
+  return num * 1_000;
+}
+
+/**
+ * Run cursor-agent in "list models" mode with enhanced parsing.
+ *
+ * Parses context window sizes from display names where available,
+ * so dynamic models get accurate context windows without manual
+ * map updates.
  */
 async function fetchCursorModels() {
   return new Promise((resolve, reject) => {
@@ -261,9 +297,14 @@ async function fetchCursorModels() {
       for (const line of stdout.split("\n")) {
         const m = line.match(/^([a-z0-9][a-z0-9._-]+)\s+-\s+(.+?)(?:\s+\((?:current|default)\))?\s*$/i);
         if (m) {
+          const id = m[1];
+          const name = m[2].trim();
+          const cw = parseContextFromDisplayName(name);
           models.push({
-            id: m[1],
-            name: m[2].trim(),
+            id,
+            name,
+            contextWindow: cw,
+            maxTokens: cw ? Math.min(cw, DEFAULT_MAX_TOKENS) : null,
             object: "model",
             created: Math.floor(Date.now() / 1000),
             owned_by: "cursor",
@@ -575,6 +616,14 @@ function formatCursorError(stderr) {
 
 // ─── Chat completions handler ─────────────────────────────────────────
 
+/**
+ * Module-level session manager instance, set when the proxy server starts.
+ * The handler reads the X-Session-Id header to route requests to the
+ * appropriate session for multi-turn conversations.
+ * @type {SessionManager|null}
+ */
+let activeSessionManager = null;
+
 function handleChatCompletions(req, res) {
   let body = "";
   req.on("data", (c) => (body += c.toString()));
@@ -595,40 +644,86 @@ function handleChatCompletions(req, res) {
       return;
     }
 
+    // Session routing: optional X-Session-Id header enables multi-turn
+    const sessionId = req.headers["x-session-id"] || "";
+
     let cursorModel = normalizeModel(model);
 
     // If a reasoning_effort is provided and we have a variant map,
     // attempt model ID substitution for collapsed families.
     if (reasoning_effort !== undefined && typeof __variantMap !== "undefined") {
-      // normalizeModel strips cursor-agent/ prefix, so cursorModel is the raw ID
       const resolved = resolveModelVariant(cursorModel, reasoning_effort, __variantMap);
       if (resolved) {
         cursorModel = resolved;
       }
     }
-    const prompt = buildPromptFromMessages(messages);
+
+    // Resolve or create session. For sessionless requests, cursorModel is
+    // re-resolved each time and no subprocess is persisted.
+    const session = activeSessionManager
+      ? activeSessionManager.getOrCreateSession(sessionId, cursorModel)
+      : null;
+
+    // Persist resolved model ID if this is a new session
+    if (session && sessionId && !session.messageHistory.length) {
+      // First turn — persist model ID for cross-turn consistency
+      session.modelId = cursorModel;
+    }
+
+    // Use persisted model ID for subsequent turns
+    const effectiveModel = (session && session.modelId) ? session.modelId : cursorModel;
+
     const id = `cursor-agent-${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
 
-    // --force auto-approves all tool calls (bash, file ops, etc.)
-    // without it, cursor-agent rejects every tool execution, making
-    // models unable to run commands or access the filesystem.
-    // Safe because the proxy binds to 127.0.0.1:32124 only.
-    const args = [
-      "--print", "--output-format", "stream-json",
-      "--model", cursorModel, "--trust", "--force",
-    ];
-    if (stream) {
-      args.push("--stream-partial-output");
+    // Check for existing subprocess in session
+    let child = session?.subprocessRef ?? null;
+    const isNewSubprocess = !child || child.killed;
+
+    if (isNewSubprocess) {
+      // Spawn a persistent subprocess (no --print, stdin stays open)
+      const args = [
+        "--output-format", "stream-json",
+        "--model", effectiveModel, "--trust", "--force",
+      ];
+      if (stream) {
+        args.push("--stream-partial-output");
+      }
+
+      child = spawn(cursorAgentPath(), args, {
+        stdio: ["pipe", "pipe", "pipe"],
+        shell: process.platform === "win32",
+      });
+
+      if (session) {
+        session.subprocessRef = child;
+      }
+
+      // Write the full session history as the initial prompt
+      if (session && session.messageHistory.length > 0) {
+        const fullPrompt = buildSessionPrompt(session);
+        child.stdin.write(fullPrompt);
+      } else {
+        const prompt = buildPromptFromMessages(messages);
+        child.stdin.write(prompt);
+      }
+      // stdin stays OPEN — no child.stdin.end()
+    } else {
+      // Reusing existing subprocess: write only new messages not yet in session history.
+      // The request body contains the full conversation history per OpenAI API
+      // convention, so we must filter to only the unseen portion.
+      if (session && session.messageHistory.length > 0) {
+        const seenCount = session.messageHistory.length;
+        const newMessages = messages.slice(-(messages.length - seenCount));
+        if (newMessages.length > 0) {
+          const newPrompt = buildPromptFromMessages(newMessages);
+          child.stdin.write(newPrompt);
+        }
+      } else {
+        const prompt = buildPromptFromMessages(messages);
+        child.stdin.write(prompt);
+      }
     }
-
-    const child = spawn(cursorAgentPath(), args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      shell: process.platform === "win32",
-    });
-
-    child.stdin.write(prompt);
-    child.stdin.end();
 
     if (stream) {
       // ── Streaming ──
@@ -677,11 +772,38 @@ function handleChatCompletions(req, res) {
         }
 
         if (event.type === "tool_call") {
-          assembledText = "";
+          // Forward tool call as SSE tool_calls delta
+          const toolCallPayload = {
+            id, object: "chat.completion.chunk", created, model: cursorModel,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: 0,
+                  id: event.id || event.toolCallId || `call_${Date.now()}`,
+                  type: "function",
+                  function: {
+                    name: event.name || event.function?.name || "",
+                    arguments: event.arguments || event.function?.arguments || JSON.stringify(event.input || {}),
+                  },
+                }],
+              },
+              finish_reason: null,
+            }],
+          };
+          res.write(`data: ${JSON.stringify(toolCallPayload)}\n\n`);
+          // Record tool call in session history if available
+          if (session && event.message) {
+            session.messageHistory.push(event.message);
+          }
           return;
         }
 
         if (event.type === "assistant" && event.message?.content) {
+          // Record assistant message in session history
+          if (session && event.message) {
+            session.messageHistory.push(event.message);
+          }
           for (const block of event.message.content) {
             if (block.type !== "text" || !block.text) continue;
             forwardAssistantText(block.text);
@@ -720,12 +842,23 @@ function handleChatCompletions(req, res) {
           } catch {}
         }
 
-        if (usage) {
-          res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [], usage: { prompt_tokens: usage.inputTokens ?? 0, completion_tokens: usage.outputTokens ?? 0, total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0), cache_read_tokens: usage.cacheReadTokens ?? 0, cache_write_tokens: usage.cacheWriteTokens ?? 0 } })}\n\n`);
+        // Accumulate usage into session
+        if (session && usage) {
+          session.accumulateUsage(usage);
+        }
+
+        const finalUsage = session ? session.tokenUsage : (usage || {});
+        if (finalUsage.inputTokens !== undefined || finalUsage.outputTokens !== undefined) {
+          res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [], usage: { prompt_tokens: finalUsage.inputTokens ?? 0, completion_tokens: finalUsage.outputTokens ?? 0, total_tokens: (finalUsage.inputTokens ?? 0) + (finalUsage.outputTokens ?? 0), cache_read_tokens: finalUsage.cacheReadTokens ?? 0, cache_write_tokens: finalUsage.cacheWriteTokens ?? 0 } })}\n\n`);
         }
         res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
+
+        // Start idle timeout for session release
+        if (session && sessionId) {
+          activeSessionManager?.releaseSession(sessionId);
+        }
       });
 
       child.on("error", (err) => {
@@ -745,7 +878,7 @@ function handleChatCompletions(req, res) {
 
       child.on("close", (code) => {
         let assistantText = "";
-        let thinkingText = "";  // accumulate thinking content
+        let thinkingText = "";
         let errorText = "";
         let usage = null;
 
@@ -753,12 +886,21 @@ function handleChatCompletions(req, res) {
           try {
             const event = JSON.parse(line.trim());
             if (event.type === "thinking") {
-              // Accumulate thinking content
               thinkingText += (event.content || event.text || "");
             }
             if (event.type === "assistant" && event.message?.content) {
+              // Record assistant message in session history
+              if (session && event.message) {
+                session.messageHistory.push(event.message);
+              }
               for (const block of event.message.content) {
                 if (block.type === "text") assistantText = block.text;
+              }
+            }
+            if (event.type === "tool_call") {
+              // Record tool call in session history for follow-up
+              if (session && event.message) {
+                session.messageHistory.push(event.message);
               }
             }
             if (event.type === "result") {
@@ -774,7 +916,13 @@ function handleChatCompletions(req, res) {
           errorText = formatCursorError(stderr.trim());
         }
 
-        // Include thinking content in the response
+        // Accumulate usage into session
+        if (session && usage) {
+          session.accumulateUsage(usage);
+        }
+
+        const finalUsage = session ? session.tokenUsage : (usage || {});
+
         const responseMessage = {
           role: "assistant",
           content: errorText || assistantText || "No response",
@@ -791,16 +939,21 @@ function handleChatCompletions(req, res) {
           model: cursorModel,
           choices: [{ index: 0, message: responseMessage, finish_reason: errorText ? "error" : "stop" }],
         };
-        if (usage) {
+        if (finalUsage.inputTokens !== undefined || finalUsage.outputTokens !== undefined) {
           responsePayload.usage = {
-            prompt_tokens: usage.inputTokens ?? 0,
-            completion_tokens: usage.outputTokens ?? 0,
-            total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
-            cache_read_tokens: usage.cacheReadTokens ?? 0,
-            cache_write_tokens: usage.cacheWriteTokens ?? 0,
+            prompt_tokens: finalUsage.inputTokens ?? 0,
+            completion_tokens: finalUsage.outputTokens ?? 0,
+            total_tokens: (finalUsage.inputTokens ?? 0) + (finalUsage.outputTokens ?? 0),
+            cache_read_tokens: finalUsage.cacheReadTokens ?? 0,
+            cache_write_tokens: finalUsage.cacheWriteTokens ?? 0,
           };
         }
         res.end(JSON.stringify(responsePayload));
+
+        // Start idle timeout for session release
+        if (session && sessionId) {
+          activeSessionManager?.releaseSession(sessionId);
+        }
       });
 
       child.on("error", (err) => {
@@ -858,6 +1011,9 @@ async function detectExistingProxy() {
 // ─── HTTP Server ──────────────────────────────────────────────────────
 
 function startProxyServer(modelsFn) {
+  // Initialize the shared session manager for multi-turn conversations
+  activeSessionManager = new SessionManager();
+
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || "/", `http://${req.headers.host || HOST}`);
@@ -895,6 +1051,14 @@ function startProxyServer(modelsFn) {
       res.end(JSON.stringify({ error: err.message }));
     }
   });
+
+  // Wrap server.close to destroy sessions before releasing the port
+  const origClose_ = server.close.bind(server);
+  server.close = (...args) => {
+    if (activeSessionManager) activeSessionManager.destroy();
+    return origClose_(...args);
+  };
+
   return server;
 }
 
@@ -1146,6 +1310,54 @@ export default async function (pi) {
   const CACHE_TTL = 60_000;
   globalThis.__variantMap = {};          // populated alongside models
   globalThis.__modelContextWindows = {};  // cached per-model context windows
+
+  // Register /cursor-refresh-models command early so it's available on all
+  // startup paths (new proxy, peer-attach, and disabled). The handler
+  // references getModels(), buildModelConfigs(), and registerCursorProvider()
+  // which are all defined later in this closure but accessible at call time.
+  pi.registerCommand("cursor-refresh-models", {
+    description: "Refresh the cursor-agent model list from the CLI",
+    handler: async (_args, ctx) => {
+      // 1. Clear disk cache
+      try { fs.unlinkSync(getCacheFilePath()); } catch {}
+
+      // 2. Reset in-memory state
+      modelsCache = [];
+      modelsCacheTime = 0;
+      modelsCacheOrigin = null;
+      globalThis.__variantMap = {};
+      globalThis.__modelContextWindows = {};
+
+      // 3. Re-fetch from CLI (disk cache cleared, so getModels will hit CLI)
+      try {
+        const freshModels = await getModels();
+        const modelConfigs = buildModelConfigs(freshModels);
+        registerCursorProvider(pi, modelConfigs);
+
+        const count = freshModels.length;
+        if (ctx.hasUI) {
+          pi.sendMessage({
+            customType: "cursor-agent",
+            content: `Refreshed ${count} cursor-agent models`,
+            display: true,
+          });
+        } else {
+          console.log(`[cursor-agent] Refreshed ${count} models`);
+        }
+      } catch (err) {
+        const msg = `Failed to refresh models: ${err.message}`;
+        if (ctx.hasUI) {
+          pi.sendMessage({
+            customType: "cursor-agent",
+            content: msg,
+            display: true,
+          });
+        } else {
+          console.error(`[cursor-agent] ${msg}`);
+        }
+      }
+    },
+  });
 
   async function getModels() {
     // Disk cache read: only on first call per extension lifecycle
@@ -1454,6 +1666,11 @@ function extractContextSuffix(modelId) {
 function buildModelContextWindows(models) {
   const cwCache = {};
   for (const m of models) {
+    // Prefer per-model contextWindow from CLI display-name parsing
+    if (m.contextWindow) {
+      cwCache[m.id] = m.contextWindow;
+      continue;
+    }
     const parsed = parseModelId(m.id);
     let key;
     if (parsed) {
