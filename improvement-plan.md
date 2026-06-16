@@ -78,7 +78,9 @@
 
 ---
 
-## Phase 4 — `/cursor-refresh-models` command
+## Phase 4 — `/cursor-refresh-models` command ✅
+
+**Status:** Complete (2026-06-15) — implemented alongside session management (Phase 4½ below). Registered early in the startup sequence so the command is available on all proxy paths (new, peer-attach, disabled). Handler clears disk cache, re-fetches from CLI, rebuilds configs, and re-registers the provider with a notification.
 
 **Goal.** Let users refresh the model catalog without restarting Pi (equivalent to pi-cursor-sdk's `/cursor-refresh-models`).
 
@@ -95,6 +97,29 @@
 - Previous model selection persists if the model still exists.
 
 **Files touched.** `extensions/cursor-agent.js` — new `registerCommand` call near the `scheduleStartupLog` / registration section.
+
+---
+
+## Phase 4½ — Session management & multi-turn support
+
+**Status:** Complete (2026-06-15) — implemented alongside `/cursor-refresh-models`. Spawns persistent cursor-agent subprocesses per session, routes via `X-Session-Id` header, accumulates token usage, and releases on idle timeout.
+
+**Goal.** Enable multi-turn conversations through cursor-agent without re-spawning the CLI on every turn. Accumulate usage across turns. Kill idle subprocesses after a configurable timeout.
+
+**Changes.**
+
+1. New `extensions/cursor-session.js` module with `CursorSession`, `SessionManager`, `buildSessionPrompt` exports.
+2. `activeSessionManager` initialized in `startProxyServer()`.
+3. Session routing in `handleChatCompletions`: `X-Session-Id` header → `getOrCreateSession()`.
+4. Session-aware prompt construction: first turn sends full history, subsequent turns send only unseen messages.
+5. Token usage accumulated across turns via `session.accumulateUsage()`.
+6. `/cursor-refresh-models` command registered early — available on all startup paths.
+7. Cache format version bumped to 2 to persist `contextWindow`/`maxTokens` fields.
+8. `parseContextFromDisplayName()` — extracts context window from CLI display names (e.g. "1M" → 1_000_000).
+9. Tool call SSE delta forwarding in streaming mode.
+10. Session idle timeout with release timer (default 5 min, configurable via `PI_CURSOR_SESSION_TIMEOUT_MS`).
+
+**Files touched.** `extensions/cursor-agent.js` — session manager import, session routing, persistent subprocess handling, tool call recording, usage accumulation, idle timeout, display name parsing, `/cursor-refresh-models` command. New `extensions/cursor-session.js` — `CursorSession`, `SessionManager`, `buildSessionPrompt`.
 
 ---
 

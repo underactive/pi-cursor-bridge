@@ -22,7 +22,197 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { SessionManager, buildSessionPrompt } from "./cursor-session.js";
+// ─── Session Management (inlined from cursor-session.js) ────────────
+
+/**
+ * Default session idle timeout (5 minutes in ms).
+ * After this period of inactivity, the session and its subprocess are
+ * released. Configurable via PI_CURSOR_SESSION_TIMEOUT_MS.
+ */
+const DEFAULT_SESSION_TIMEOUT_MS = 300_000;
+
+function getSessionTimeout() {
+  const env = process.env.PI_CURSOR_SESSION_TIMEOUT_MS;
+  if (env) {
+    const n = parseInt(env, 10);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  return DEFAULT_SESSION_TIMEOUT_MS;
+}
+
+/**
+ * Represents a single multi-turn conversation session with cursor-agent.
+ */
+class CursorSession {
+  /**
+   * @param {string} sessionId — UUID or caller-provided session identifier
+   * @param {string} modelId — resolved cursor-agent model ID (--model arg)
+   */
+  constructor(sessionId, modelId) {
+    this.sessionId = sessionId;
+    this.modelId = modelId;
+    this.messageHistory = [];
+    this.tokenUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+    this.subprocessRef = null;
+    this.createdAt = Date.now();
+    this.lastActivityAt = Date.now();
+  }
+
+  touch() { this.lastActivityAt = Date.now(); }
+
+  addMessages(messages) {
+    const msgs = Array.isArray(messages) ? messages : [messages];
+    this.messageHistory.push(...msgs);
+    this.touch();
+  }
+
+  resetHistory() {
+    this.messageHistory = [];
+    this.tokenUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+    this.touch();
+  }
+
+  accumulateUsage(usage) {
+    if (!usage) return;
+    this.tokenUsage.inputTokens += usage.inputTokens ?? 0;
+    this.tokenUsage.outputTokens += usage.outputTokens ?? 0;
+    this.tokenUsage.cacheReadTokens += usage.cacheReadTokens ?? 0;
+    this.tokenUsage.cacheWriteTokens += usage.cacheWriteTokens ?? 0;
+  }
+
+  isExpired(timeoutMs) {
+    const ttl = timeoutMs ?? getSessionTimeout();
+    return Date.now() - this.lastActivityAt > ttl;
+  }
+}
+
+/**
+ * Manages the lifecycle of all active CursorSession instances.
+ */
+class SessionManager {
+  constructor() {
+    this._sessions = new Map();
+    this._releaseTimers = new Map();
+  }
+
+  getOrCreateSession(sessionId, modelId) {
+    if (!sessionId) {
+      return new CursorSession("", modelId);
+    }
+
+    let session = this._sessions.get(sessionId);
+    if (session) {
+      const timer = this._releaseTimers.get(sessionId);
+      if (timer) {
+        clearTimeout(timer);
+        this._releaseTimers.delete(sessionId);
+      }
+      session.touch();
+      return session;
+    }
+
+    session = new CursorSession(sessionId, modelId);
+    this._sessions.set(sessionId, session);
+    return session;
+  }
+
+  getSession(sessionId) {
+    return this._sessions.get(sessionId) ?? null;
+  }
+
+  releaseSession(sessionId, timeoutMs) {
+    const session = this._sessions.get(sessionId);
+    if (!session) return;
+
+    if (this._releaseTimers.has(sessionId)) return;
+
+    const ttl = timeoutMs ?? getSessionTimeout();
+    const timer = setTimeout(() => {
+      this._cleanupSession(sessionId);
+    }, ttl);
+
+    if (timer.unref) timer.unref();
+    this._releaseTimers.set(sessionId, timer);
+  }
+
+  removeSession(sessionId) {
+    this._cleanupSession(sessionId);
+  }
+
+  cleanup(timeoutMs) {
+    const ttl = timeoutMs ?? getSessionTimeout();
+    const now = Date.now();
+    for (const [id, session] of this._sessions) {
+      if (now - session.lastActivityAt > ttl) {
+        this._cleanupSession(id);
+      }
+    }
+  }
+
+  destroy() {
+    for (const [id] of this._sessions) {
+      this._cleanupSession(id);
+    }
+    for (const [id, timer] of this._releaseTimers) {
+      clearTimeout(timer);
+      this._releaseTimers.delete(id);
+    }
+  }
+
+  _cleanupSession(sessionId) {
+    const session = this._sessions.get(sessionId);
+    if (!session) return;
+
+    const child = session.subprocessRef;
+    if (child && !child.killed) {
+      try { child.kill(); } catch {}
+    }
+
+    const timer = this._releaseTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      this._releaseTimers.delete(sessionId);
+    }
+
+    this._sessions.delete(sessionId);
+  }
+}
+
+/**
+ * Build a text prompt from a session's message history that cursor-agent
+ * can understand.
+ */
+function buildSessionPrompt(session) {
+  const parts = [];
+
+  for (const msg of session.messageHistory) {
+    const role = msg.role || "user";
+    let content = "";
+
+    if (typeof msg.content === "string") {
+      content = msg.content;
+    } else if (Array.isArray(msg.content)) {
+      content = msg.content
+        .filter((c) => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
+    }
+
+    if (role === "system") {
+      parts.push(`<|im_start|>system\n${content}\n<|im_end|>`);
+    } else if (role === "user") {
+      parts.push(`<|im_start|>user\n${content}\n<|im_end|>`);
+    } else if (role === "assistant") {
+      parts.push(`<|im_start|>assistant\n${content}\n<|im_end|>`);
+    } else if (role === "tool") {
+      const toolName = msg.name ? ` (${msg.name})` : "";
+      const toolCallId = msg.tool_call_id ? ` [call:${msg.tool_call_id}]` : "";
+      parts.push(`<|im_start|>tool${toolName}${toolCallId}\n${content}\n<|im_end|>`);
+    }
+  }
+
+  return parts.join("\n");
+}
 
 // ─── Config ───────────────────────────────────────────────────────────
 
@@ -1210,7 +1400,7 @@ function buildModelConfigs(models) {
     const mt = MAX_TOKENS_MAP[base] ?? DEFAULT_MAX_TOKENS;
 
     configs.push({
-      id: `${PROVIDER_ID}/${base}`,
+      id: base,
       name: base,
       reasoning: true,
       thinkingLevelMap: buildThinkingLevelMap(entry),
@@ -1224,7 +1414,7 @@ function buildModelConfigs(models) {
     if (cw !== FALLBACK_CONTEXT_WINDOW) {
       const suffix = contextWindowToSuffix(cw);
       configs.push({
-        id: `${PROVIDER_ID}/${base}@${suffix}`,
+        id: `${base}@${suffix}`,
         name: `${base}@${suffix}`,
         reasoning: true,
         thinkingLevelMap: buildThinkingLevelMap(entry),
@@ -1244,7 +1434,7 @@ function buildModelConfigs(models) {
     const mt = MAX_TOKENS_MAP[mapKey] ?? DEFAULT_MAX_TOKENS;
 
     configs.push({
-      id: `${PROVIDER_ID}/${id}`,
+      id: id,
       name: id,
       reasoning: false,
       input: ["text"],
@@ -1257,7 +1447,7 @@ function buildModelConfigs(models) {
     if (cw !== FALLBACK_CONTEXT_WINDOW) {
       const suffix = contextWindowToSuffix(cw);
       configs.push({
-        id: `${PROVIDER_ID}/${mapKey}@${suffix}`,
+        id: `${mapKey}@${suffix}`,
         name: `${mapKey}@${suffix}`,
         reasoning: false,
         input: ["text"],
