@@ -1666,6 +1666,7 @@ function buildSdkModelConfigs(models) {
       fast: Boolean(paramById.fast),
     };
 
+    const supportsImage = VISION_CAPABLE_SDK_MODELS.has(model.id);
     const contextValues = paramById.context ? paramById.context.values.map((v) => v.value) : [null];
     for (const ctx of contextValues) {
       const piId = ctx ? `${model.id}@${ctx}` : model.id;
@@ -1676,7 +1677,7 @@ function buildSdkModelConfigs(models) {
         api: CURSOR_SDK_API,
         reasoning,
         ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
-        input: ["text"],
+        input: supportsImage ? ["text", "image"] : ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow,
         maxTokens: SDK_DEFAULT_MAX_TOKENS,
@@ -1853,6 +1854,26 @@ function extractSdkText(content) {
     if (b && b.type === "text") return b.text;
     return "";
   }).filter(Boolean).join("");
+}
+
+/**
+ * Collect Pi ImageContent parts from user turns into SDK SDKImage[] — base64
+ * passthrough (Pi's { data, mimeType } maps 1:1 onto the SDK's image shape).
+ * Scans the whole history: the SDK backend uses a fresh agent per turn, so
+ * earlier images must be re-sent for multi-turn image conversations to work.
+ * User turns only — tool-produced images are a separate concern (backlog).
+ */
+function collectSdkImages(context) {
+  const images = [];
+  for (const msg of (context && context.messages) || []) {
+    if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const part of msg.content) {
+      if (part && part.type === "image" && typeof part.data === "string" && part.data) {
+        images.push({ data: part.data, mimeType: part.mimeType || "image/png" });
+      }
+    }
+  }
+  return images;
 }
 
 /** Map an SDK/transport error to a short, key-scrubbed, user-facing message. */
@@ -2078,6 +2099,7 @@ async function startBridgeRun(sessionKey, stream, model, context, options) {
   const prompt = hasTools
     ? `${bridgeSteeringPreamble(customNames)}\n${buildSdkPrompt(context)}`
     : buildSdkPrompt(context);
+  const images = collectSdkImages(context);
 
   const signal = options && options.signal;
   const onAbort = () => {
@@ -2099,9 +2121,10 @@ async function startBridgeRun(sessionKey, stream, model, context, options) {
       mode: "agent",
       local: hasTools ? { cwd: backendCwd, customTools } : { cwd: backendCwd },
     });
-    liveRun.sendPromise = liveRun.agent.send({ text: prompt }, {
-      onDelta: ({ update }) => handleBridgeDelta(liveRun, update),
-    });
+    liveRun.sendPromise = liveRun.agent.send(
+      images.length ? { text: prompt, images } : { text: prompt },
+      { onDelta: ({ update }) => handleBridgeDelta(liveRun, update) },
+    );
     // The whole agentic loop (spanning tool turns) completes here.
     liveRun.sendPromise
       .then(async (run) => {
@@ -2687,6 +2710,28 @@ const FALLBACK_CONTEXT_WINDOW = 200000;
  * Default max tokens for models not in MAX_TOKENS_MAP.
  */
 const DEFAULT_MAX_TOKENS = 16384;
+
+/**
+ * Cursor models known to accept image input, keyed by SDK base id (the clean
+ * ids Cursor.models.list() returns, e.g. "claude-opus-4-8" — not the CLI's
+ * "claude-4.6-opus"). The SDK catalog exposes no vision flag, so capability is
+ * declared, not detected. Unknown ids stay text-only (safe failure). Seeded
+ * conservatively; codex, nano, auto, composer and kimi families omitted until
+ * confirmed. Hand-maintained like MODEL_CONTEXT_WINDOWS; re-applied by
+ * /cursor-refresh-models.
+ */
+const VISION_CAPABLE_SDK_MODELS = new Set([
+  // Claude — all 3+ tiers are multimodal (ids reconciled against Cursor.models.list()).
+  "claude-fable-5", "claude-haiku-4-5",
+  "claude-opus-4-5", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8",
+  "claude-sonnet-4", "claude-sonnet-4-5", "claude-sonnet-4-6",
+  // GPT-5 family (codex/nano omitted — image support unconfirmed).
+  "gpt-5-mini", "gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
+  // Gemini (2.5+ multimodal).
+  "gemini-2.5-flash", "gemini-3-flash", "gemini-3.1-pro", "gemini-3.5-flash",
+  // Grok (grok-build omitted).
+  "grok-4.3",
+]);
 
 /**
  * Per-model context window values.

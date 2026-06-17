@@ -146,7 +146,9 @@
 
 ---
 
-## Phase 6 — Image input support
+## Phase 6 — Image input support ✅
+
+**Status:** Complete (2026-06-16) — implemented via #plan in `~/.claude/plans/virtual-wondering-eich.md`, validated end-to-end in Pi (image round-trip + multi-turn recall). Landed on the **SDK backend only**: the `cursor-agent` CLI exposes no image flag (its `--help` carries only a text prompt + `--print`/`--output-format`/`--model`), so the proxy/CLI path stays text-only — which also stops Pi from routing images down a dead path, since Pi gates its uploader on `input` containing `"image"`. The SDK's `agent.send({ text, images })` accepts `SDKImage` (`{data, mimeType}`), and Pi's native `ImageContent` (`{type:"image", data, mimeType}`) maps onto it 1:1. New `collectSdkImages()` gathers user-turn images across the full history (the SDK backend uses a fresh agent per turn, so earlier images must be re-sent), `startBridgeRun` attaches them to the single `agent.send`, and `buildSdkModelConfigs` advertises `input: ["text","image"]` for models in a curated `VISION_CAPABLE_SDK_MODELS` set. The SDK catalog has no vision flag, so capability is declared, not detected; the set was reconciled against real discovered SDK ids (`claude-opus-4-6`, not the CLI's `claude-4.6-opus`) via `pi --list-models cursor-agent`. `/cursor-refresh-models` re-applies it for free.
 
 **Goal.** Accept image parts in `/v1/chat/completions` messages and forward them to the `cursor-agent` CLI so Cursor models can see images.
 
@@ -213,7 +215,7 @@
 | 3 | Disk model cache | Low | Medium — faster startups | ✅ Complete |
 | 4 | `/cursor-refresh-models` | Low | Medium — no reload needed for new models | ✅ Complete |
 | 5 | Pi-native auth flow | Medium | High — no external CLI login step | ✅ Complete |
-| 6 | Image input | Low | Medium — image support in chat |
+| 6 | Image input | Low | Medium — image support in chat | ✅ Complete |
 | 7 | Optional `@cursor/sdk` backend | High | High — fixes model-routing reliability, unlocks deep integration | ✅ v1 (text+thinking) Complete |
 
 Phases 1-4 are the highest-value-per-effort. Phase 5 is the biggest UX improvement for Pi-native feel. Phase 7 is a major re-architecture that preserves the proxy for non-Pi clients while gaining `pi-cursor-sdk`-level integration.
