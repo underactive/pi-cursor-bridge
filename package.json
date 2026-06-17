@@ -25,7 +25,11 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  },
+  "optionalDependencies": {
+    "@cursor/sdk": "^1.0.18"
   },
   "engines": {
     "node": ">=18"

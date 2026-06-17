@@ -20,8 +20,10 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { createRequire } from "node:module";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 // ─── Session Management (inlined from cursor-session.js) ────────────
 
 /**
@@ -263,6 +265,43 @@ const CACHE_FORMAT_VERSION = 2;
 const DISABLE_MODEL_CACHE = process.env.PI_CURSOR_DISABLE_MODEL_CACHE === "1";
 
 /**
+ * Cached API key from ~/.pi/agent/auth.json.
+ * Populated once at startup by extractAuthKey().
+ * @type {string|null}
+ */
+let cachedAuthKey = null;
+
+/**
+ * Read the stored API key from ~/.pi/agent/auth.json (Pi's AuthStorage file)
+ * and cache it in the module-level cachedAuthKey variable.
+ *
+ * Called once at extension startup. Silently returns null if the file doesn't
+ * exist or if cursor-agent isn't configured there — the auth hash and spawn
+ * callers use null to mean "no Pi-stored key" (rely on cursor-agent login).
+ *
+ * The auth.json structure is:
+ *   { "cursor-agent": { type: "api_key", key: "ck-..." } }
+ *
+ * @returns {string|null}
+ */
+function extractAuthKey() {
+  try {
+    const home = process.env.HOME || process.env.USERPROFILE || "/tmp";
+    const authPath = path.join(home, ".pi", "agent", "auth.json");
+    const data = JSON.parse(fs.readFileSync(authPath, "utf8"));
+    const entry = data[PROVIDER_ID];
+    if (entry && entry.type === "api_key" && entry.key) {
+      cachedAuthKey = entry.key;
+      return cachedAuthKey;
+    }
+  } catch {
+    // ENOENT (no auth file yet), corrupt JSON, or missing entry — fall through
+  }
+  cachedAuthKey = null;
+  return null;
+}
+
+/**
  * Resolve the cache TTL from env var or default (24h).
  */
 function getCacheTTL() {
@@ -287,8 +326,9 @@ function getCacheFilePath() {
  *
  * Sources (in priority order):
  *   1. CURSOR_API_KEY env var
- *   2. ~/.cursor/cli-config.json (authInfo + serverConfigCache)
- *   3. Unauthenticated sentinel
+ *   2. ~/.pi/agent/auth.json (Pi AuthStorage — populated by /login)
+ *   3. ~/.cursor/cli-config.json (authInfo + serverConfigCache)
+ *   4. Unauthenticated sentinel
  *
  * @returns {string} hex-encoded SHA-256 hash
  */
@@ -296,6 +336,11 @@ function getAuthHash() {
   const apiKey = process.env.CURSOR_API_KEY;
   if (apiKey) {
     return crypto.createHash("sha256").update(`apikey:${apiKey}`).digest("hex");
+  }
+
+  // Pi-stored API key (from /login)
+  if (cachedAuthKey) {
+    return crypto.createHash("sha256").update(`pikey:${cachedAuthKey}`).digest("hex");
   }
 
   try {
@@ -473,6 +518,9 @@ async function fetchCursorModels() {
     const child = spawn(cursorAgentPath(), ["models", "--trust"], {
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32",
+      env: cachedAuthKey
+        ? { ...process.env, CURSOR_API_KEY: cachedAuthKey }
+        : { ...process.env },
     });
     let stdout = "";
     let stderr = "";
@@ -526,16 +574,17 @@ function buildPromptFromMessages(messages) {
     }
     if (!content) continue;
     if (role === "system") {
-      parts.push(content);
+      parts.push(`<|im_start|>system\n${content}\n<|im_end|>`);
     } else if (role === "user") {
-      parts.push(content);
+      parts.push(`<|im_start|>user\n${content}\n<|im_end|>`);
     } else if (role === "assistant") {
-      parts.push(content);
+      parts.push(`<|im_start|>assistant\n${content}\n<|im_end|>`);
     } else if (role === "tool") {
-      parts.push(`[Tool result from ${msg.name || "tool"}]: ${content}`);
+      const toolName = msg.name ? ` (${msg.name})` : "";
+      parts.push(`<|im_start|>tool${toolName}\n${content}\n<|im_end|>`);
     }
   }
-  return parts.join("\n\n");
+  return parts.join("\n");
 }
 
 function normalizeModel(modelId) {
@@ -839,9 +888,12 @@ function handleChatCompletions(req, res) {
 
     let cursorModel = normalizeModel(model);
 
-    // If a reasoning_effort is provided and we have a variant map,
-    // attempt model ID substitution for collapsed families.
-    if (reasoning_effort !== undefined && typeof __variantMap !== "undefined") {
+    // Always attempt model ID resolution for collapsed families.
+    // cursor-agent only knows specific variant IDs (e.g. "gpt-5.5-high"),
+    // not family base names (e.g. "gpt-5.5"). resolveModelVariant handles
+    // both with and without reasoning_effort — when absent, it returns
+    // the default variant.
+    if (typeof __variantMap !== "undefined") {
       const resolved = resolveModelVariant(cursorModel, reasoning_effort, __variantMap);
       if (resolved) {
         cursorModel = resolved;
@@ -866,54 +918,34 @@ function handleChatCompletions(req, res) {
     const id = `cursor-agent-${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
 
-    // Check for existing subprocess in session
-    let child = session?.subprocessRef ?? null;
-    const isNewSubprocess = !child || child.killed;
-
-    if (isNewSubprocess) {
-      // Spawn a persistent subprocess (no --print, stdin stays open)
-      const args = [
-        "--output-format", "stream-json",
-        "--model", effectiveModel, "--trust", "--force",
-      ];
-      if (stream) {
-        args.push("--stream-partial-output");
-      }
-
-      child = spawn(cursorAgentPath(), args, {
-        stdio: ["pipe", "pipe", "pipe"],
-        shell: process.platform === "win32",
-      });
-
-      if (session) {
-        session.subprocessRef = child;
-      }
-
-      // Write the full session history as the initial prompt
-      if (session && session.messageHistory.length > 0) {
-        const fullPrompt = buildSessionPrompt(session);
-        child.stdin.write(fullPrompt);
-      } else {
-        const prompt = buildPromptFromMessages(messages);
-        child.stdin.write(prompt);
-      }
-      // stdin stays OPEN — no child.stdin.end()
-    } else {
-      // Reusing existing subprocess: write only new messages not yet in session history.
-      // The request body contains the full conversation history per OpenAI API
-      // convention, so we must filter to only the unseen portion.
-      if (session && session.messageHistory.length > 0) {
-        const seenCount = session.messageHistory.length;
-        const newMessages = messages.slice(-(messages.length - seenCount));
-        if (newMessages.length > 0) {
-          const newPrompt = buildPromptFromMessages(newMessages);
-          child.stdin.write(newPrompt);
-        }
-      } else {
-        const prompt = buildPromptFromMessages(messages);
-        child.stdin.write(prompt);
-      }
+    // Always spawn a fresh subprocess per request. cursor-agent reads stdin
+    // until EOF, so we must close stdin after writing the prompt to signal
+    // that input is complete. The subprocess exits after processing.
+    const args = [
+      "--output-format", "stream-json",
+      "--model", effectiveModel, "--trust", "--force",
+    ];
+    if (stream) {
+      args.push("--stream-partial-output");
     }
+
+    const child = spawn(cursorAgentPath(), args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: process.platform === "win32",
+      env: cachedAuthKey
+        ? { ...process.env, CURSOR_API_KEY: cachedAuthKey }
+        : { ...process.env },
+    });
+
+    if (session) {
+      session.subprocessRef = child;
+    }
+
+    // Build prompt from the request body messages (OpenAI API convention sends
+    // the full conversation history on every request).
+    const prompt = buildPromptFromMessages(messages);
+    child.stdin.write(prompt);
+    child.stdin.end();
 
     if (stream) {
       // ── Streaming ──
@@ -1025,6 +1057,9 @@ function handleChatCompletions(req, res) {
       });
 
       child.on("close", () => {
+        // Clear subprocess ref so the next request spawns a fresh subprocess
+        if (session) { session.subprocessRef = null; }
+
         for (const line of lineBuffer) {
           if (!line.trim()) continue;
           try {
@@ -1067,6 +1102,9 @@ function handleChatCompletions(req, res) {
       child.stderr.on("data", (d) => (stderr += d.toString()));
 
       child.on("close", (code) => {
+        // Clear subprocess ref so the next request spawns a fresh subprocess
+        if (session) { session.subprocessRef = null; }
+
         let assistantText = "";
         let thinkingText = "";
         let errorText = "";
@@ -1290,6 +1328,10 @@ function scheduleStartupLog(pi) {
   });
 
   pi.on("session_start", (event, ctx) => {
+    // Capture cwd for the SDK backend — Pi does not pass cwd into streamSimple,
+    // so the backend reads it from here. Runs on every session_start.
+    if (ctx && ctx.cwd) setCursorSdkCwd(ctx.cwd);
+
     if (event.reason !== "startup" && event.reason !== "reload") return;
     const payload = startupLog;
     if (!payload) return;
@@ -1461,6 +1503,712 @@ function buildModelConfigs(models) {
   return configs;
 }
 
+// ─── @cursor/sdk backend (Phase 7, inlined) ──────────────────────────────────
+//
+// Optional backend that talks to Cursor via @cursor/sdk instead of the CLI/proxy.
+// The CLI exposes effort/thinking ONLY as effort-baked model-ID strings; collapsing
+// those into families and re-expanding by reasoning_effort is lossy — a family that
+// lacks the requested tier resolves to a bare, invalid model name cursor-agent
+// rejects, so the user gets no reply. The SDK returns CLEAN base IDs with a
+// structured `parameters` array (thinking/context/effort/fast); effort travels as
+// a ModelSelection.params entry, never the ID, and a missing tier is simply omitted.
+//
+// Inlined (not a separate module) because Pi loads each extension as a single
+// symlinked file via jiti — a sibling file wouldn't resolve. Matches how
+// cursor-session.js was inlined.
+//
+// RUNTIME: @cursor/sdk uses connect-rpc + a native binary. Transient transport
+// errors (rare) surface as NetworkError; discovery failures fall back to the CLI
+// path automatically. Verified working on Node 24 and 26.
+// V1 SCOPE: direct text+thinking streaming, real usage, abort, sanitized errors,
+// plus a Pi→Cursor MCP tool bridge so Pi-side tools are surfaced (below).
+
+/** Provider `api` key for the SDK backend. Must match the model configs' api. */
+const CURSOR_SDK_API = "cursor-sdk";
+const SDK_APPROX_CHARS_PER_TOKEN = 4;
+const SDK_DEFAULT_MAX_TOKENS = 32000;
+const SDK_FALLBACK_CONTEXT_WINDOW = 200000;
+const SDK_THINKING_TRACE_MAX_CHARS = 50000;
+
+/** @type {Promise<any> | null} */
+let sdkModulePromise = null;
+/** @type {boolean | null} */
+let sdkAvailable = null;
+
+/**
+ * Point @cursor/sdk at its bundled ripgrep binary via CURSOR_RIPGREP_PATH.
+ *
+ * The SDK's local-agent workspace scan (initializeIgnoreMapping) shells out to
+ * ripgrep to read .gitignore/.cursorignore. It tries to auto-locate `rg` from
+ * its platform package relative to process.argv[1] — which under jiti/Pi is
+ * Pi's CLI, not us — so it fails and (when uncaught) leaks an async rejection.
+ * The binary ships in `@cursor/sdk-<platform>-<arch>/bin/rg`; resolve it and set
+ * the env var the SDK reads. Best-effort: if it can't be found, the SDK degrades
+ * to no ignore filtering (and we already guard the leaked rejection).
+ */
+function configureSdkRipgrep() {
+  if (process.env.CURSOR_RIPGREP_PATH) return;
+  try {
+    const require = createRequire(import.meta.url);
+    const platformPkg = `@cursor/sdk-${process.platform}-${process.arch}`;
+    const pkgJson = require.resolve(`${platformPkg}/package.json`);
+    const rg = path.join(path.dirname(pkgJson), "bin", "rg");
+    if (fs.existsSync(rg)) process.env.CURSOR_RIPGREP_PATH = rg;
+  } catch { /* leave unset; ignore-mapping degrades gracefully */ }
+}
+
+/** Dynamically import @cursor/sdk. Cached. Returns the module or null on failure. */
+async function loadCursorSdk() {
+  if (sdkModulePromise === null) {
+    configureSdkRipgrep();
+    sdkModulePromise = import("@cursor/sdk").catch(() => null);
+  }
+  return sdkModulePromise;
+}
+
+/** True when @cursor/sdk can be imported. Cached after the first call. */
+async function isCursorSdkAvailable() {
+  if (sdkAvailable === null) {
+    sdkAvailable = (await loadCursorSdk()) !== null;
+  }
+  return sdkAvailable;
+}
+
+/** @type {string|null} API key resolved by the host (Pi AuthStorage / env). */
+let backendAuthKey = null;
+/** @type {string} cwd captured from Pi's session_start. */
+let backendCwd = process.cwd();
+
+function setCursorSdkAuthKey(key) { backendAuthKey = key || null; }
+function setCursorSdkCwd(cwd) { if (typeof cwd === "string" && cwd) backendCwd = cwd; }
+
+/** Resolve the effective API key (Pi passes a placeholder through options.apiKey). */
+function resolveSdkApiKey(optionApiKey) {
+  const candidate = (optionApiKey || "").trim();
+  if (candidate && candidate.length > 20 && !candidate.startsWith("$") && !candidate.includes("placeholder")) {
+    return candidate;
+  }
+  return backendAuthKey || process.env.CURSOR_API_KEY || null;
+}
+
+/** @type {Record<string, object>} Pi model id → selection metadata. */
+let sdkMetadata = {};
+
+/** Fetch the raw model catalog from the SDK. */
+async function discoverSdkModels(apiKey) {
+  const sdk = await loadCursorSdk();
+  if (!sdk) throw new Error("@cursor/sdk not available");
+  return sdk.Cursor.models.list({ apiKey });
+}
+
+function sdkContextValueToTokens(value) {
+  const m = String(value || "").match(/^(\d+(?:\.\d+)?)([km])$/i);
+  if (!m) return SDK_FALLBACK_CONTEXT_WINDOW;
+  const num = parseFloat(m[1]);
+  return m[2].toLowerCase() === "m" ? Math.round(num * 1_000_000) : Math.round(num * 1_000);
+}
+
+/**
+ * Build a Pi thinkingLevelMap from a model's parameter set. Values are the
+ * concrete param value per Pi level; null marks a level unsupported. Returns
+ * null when the model exposes no reasoning controls. Precedence effort > reasoning.
+ */
+function buildSdkThinkingLevelMap(paramById) {
+  const pick = (param, wanted) => {
+    if (!param) return null;
+    const values = param.values.map((v) => v.value);
+    for (const w of wanted) if (values.includes(w)) return w;
+    return null;
+  };
+  const effort = paramById.effort;
+  const reasoning = paramById.reasoning;
+  const thinking = paramById.thinking;
+  if (effort) {
+    const low = pick(effort, ["low", "minimal"]);
+    return { off: null, minimal: low, low, medium: pick(effort, ["medium"]), high: pick(effort, ["high"]), xhigh: pick(effort, ["max", "extra-high", "xhigh", "high"]) };
+  }
+  if (reasoning) {
+    const low = pick(reasoning, ["low", "minimal"]);
+    return { off: null, minimal: low, low, medium: pick(reasoning, ["medium"]), high: pick(reasoning, ["high"]), xhigh: pick(reasoning, ["high", "medium"]) };
+  }
+  if (thinking) {
+    return { off: null, minimal: "true", low: "true", medium: "true", high: "true", xhigh: "true" };
+  }
+  return null;
+}
+
+/**
+ * Transform the SDK catalog into Pi ProviderModelConfig[] and populate the
+ * selection metadata. One Pi entry per (model × context value); effort/thinking
+ * stay request-time params. `fast` is deferred.
+ */
+function buildSdkModelConfigs(models) {
+  const configs = [];
+  const metadata = {};
+  for (const model of models) {
+    if (!model || !model.id || model.id === "default") continue;
+    const params = Array.isArray(model.parameters) ? model.parameters : [];
+    const paramById = {};
+    for (const p of params) paramById[p.id] = p;
+
+    const thinkingLevelMap = buildSdkThinkingLevelMap(paramById);
+    const reasoning = thinkingLevelMap !== null;
+
+    const variants = Array.isArray(model.variants) ? model.variants : [];
+    const defaultVariant = variants.find((v) => v.isDefault) || variants[0] || { params: [] };
+    const defaultParams = Array.isArray(defaultVariant.params) ? defaultVariant.params : [];
+
+    const paramIds = {
+      effort: Boolean(paramById.effort),
+      reasoning: Boolean(paramById.reasoning),
+      thinking: Boolean(paramById.thinking),
+      context: Boolean(paramById.context),
+      fast: Boolean(paramById.fast),
+    };
+
+    const contextValues = paramById.context ? paramById.context.values.map((v) => v.value) : [null];
+    for (const ctx of contextValues) {
+      const piId = ctx ? `${model.id}@${ctx}` : model.id;
+      const contextWindow = ctx ? sdkContextValueToTokens(ctx) : SDK_FALLBACK_CONTEXT_WINDOW;
+      configs.push({
+        id: piId,
+        name: ctx ? `${model.displayName || model.id} (${ctx})` : (model.displayName || model.id),
+        api: CURSOR_SDK_API,
+        reasoning,
+        ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow,
+        maxTokens: SDK_DEFAULT_MAX_TOKENS,
+      });
+      metadata[piId] = { baseId: model.id, defaultParams, paramIds, contextValue: ctx, thinkingLevelMap: thinkingLevelMap || {} };
+    }
+  }
+  sdkMetadata = metadata;
+  return { configs, count: configs.length };
+}
+
+/**
+ * Build the SDK ModelSelection { id, params } for a Pi model id + thinking level.
+ * Effort/thinking applied as params, context from the @ suffix. A level the model
+ * lacks is omitted — never a broken id.
+ */
+function buildCursorModelSelection(piModelId, thinkingLevel) {
+  const meta = sdkMetadata[piModelId];
+  if (!meta) {
+    const base = piModelId.replace(/@[a-z0-9.]+$/i, "");
+    return { id: base };
+  }
+  const params = new Map(meta.defaultParams.map((p) => [p.id, p.value]));
+  if (meta.contextValue && meta.paramIds.context) params.set("context", meta.contextValue);
+
+  const level = thinkingLevel || "off";
+  const mapped = meta.thinkingLevelMap[level];
+  if (mapped !== undefined && mapped !== null) {
+    if (meta.paramIds.effort) {
+      if (meta.paramIds.thinking) params.set("thinking", "true");
+      params.set("effort", mapped);
+    } else if (meta.paramIds.reasoning) {
+      params.set("reasoning", mapped);
+    } else if (meta.paramIds.thinking) {
+      params.set("thinking", mapped);
+    }
+  } else if (meta.paramIds.thinking && level === "off") {
+    params.set("thinking", "false");
+  }
+  const paramList = [...params.entries()].map(([id, value]) => ({ id, value }));
+  return paramList.length > 0 ? { id: meta.baseId, params: paramList } : { id: meta.baseId };
+}
+
+/** Build the zeroed initial AssistantMessage Pi accumulates into. */
+function makeSdkInitialMessage(model) {
+  return {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+}
+
+/**
+ * Emits Pi text/thinking content events while maintaining partial.content +
+ * contentIndex bookkeeping (text/thinking are mutually-exclusive blocks).
+ */
+class SdkPartialEmitter {
+  constructor(stream, partial) {
+    this.stream = stream;
+    this.partial = partial;
+    this.thinkingIndex = -1;
+    this.textIndex = -1;
+    this.thinkingChars = 0;
+    this.thinkingTruncated = false;
+  }
+  closeThinking() {
+    if (this.thinkingIndex < 0) return;
+    const block = this.partial.content[this.thinkingIndex];
+    if (block && block.type === "thinking") {
+      this.stream.push({ type: "thinking_end", contentIndex: this.thinkingIndex, content: block.thinking, partial: this.partial });
+    }
+    this.thinkingIndex = -1;
+  }
+  closeText() {
+    if (this.textIndex < 0) return "";
+    const i = this.textIndex;
+    const block = this.partial.content[i];
+    this.textIndex = -1;
+    if (!block || block.type !== "text") return "";
+    this.stream.push({ type: "text_end", contentIndex: i, content: block.text, partial: this.partial });
+    return block.text;
+  }
+  appendThinking(delta) {
+    this.closeText();
+    if (this.thinkingTruncated || !delta) return;
+    let text = delta;
+    if (this.thinkingChars + text.length > SDK_THINKING_TRACE_MAX_CHARS) {
+      const remaining = Math.max(SDK_THINKING_TRACE_MAX_CHARS - this.thinkingChars, 0);
+      text = `${text.slice(0, remaining)}\n[Cursor activity trace truncated]\n`;
+      this.thinkingTruncated = true;
+    }
+    if (!text) return;
+    if (this.thinkingIndex < 0) {
+      this.thinkingIndex = this.partial.content.length;
+      this.partial.content.push({ type: "thinking", thinking: "" });
+      this.stream.push({ type: "thinking_start", contentIndex: this.thinkingIndex, partial: this.partial });
+    }
+    const block = this.partial.content[this.thinkingIndex];
+    if (!block || block.type !== "thinking") return;
+    block.thinking += text;
+    this.thinkingChars += text.length;
+    this.stream.push({ type: "thinking_delta", contentIndex: this.thinkingIndex, delta: text, partial: this.partial });
+  }
+  appendText(delta) {
+    this.closeThinking();
+    if (!delta) return;
+    if (this.textIndex < 0) {
+      this.textIndex = this.partial.content.length;
+      this.partial.content.push({ type: "text", text: "" });
+      this.stream.push({ type: "text_start", contentIndex: this.textIndex, partial: this.partial });
+    }
+    const block = this.partial.content[this.textIndex];
+    if (!block || block.type !== "text") return;
+    block.text += delta;
+    this.stream.push({ type: "text_delta", contentIndex: this.textIndex, delta, partial: this.partial });
+  }
+  currentText() {
+    if (this.textIndex < 0) return "";
+    const block = this.partial.content[this.textIndex];
+    return block && block.type === "text" ? block.text : "";
+  }
+  /** Emit a Pi toolCall content block (used by the tool bridge). */
+  emitToolCall(id, name, args) {
+    this.closeThinking();
+    this.closeText();
+    const contentIndex = this.partial.content.length;
+    const toolCall = { type: "toolCall", id, name, arguments: args || {} };
+    this.partial.content.push(toolCall);
+    this.stream.push({ type: "toolcall_start", contentIndex, partial: this.partial });
+    this.stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(args || {}), partial: this.partial });
+    this.stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: this.partial });
+  }
+}
+
+/** A resolvable/rejectable promise (for cross-turn tool bridging). */
+function sdkDeferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+function estimateSdkTokens(text) {
+  return Math.max(0, Math.ceil((text || "").length / SDK_APPROX_CHARS_PER_TOKEN));
+}
+
+/** Flatten Pi's Context into a single prompt string for one SDK agent send. */
+function buildSdkPrompt(context) {
+  const parts = [];
+  if (context.systemPrompt) parts.push(context.systemPrompt);
+  for (const msg of context.messages || []) {
+    if (msg.role === "user") {
+      parts.push(`User: ${extractSdkText(msg.content)}`);
+    } else if (msg.role === "assistant") {
+      const text = extractSdkText(msg.content);
+      if (text) parts.push(`Assistant: ${text}`);
+    } else if (msg.role === "toolResult") {
+      const body = typeof msg.content === "string" ? msg.content : extractSdkText(msg.content);
+      parts.push(`[Tool result${msg.toolName ? ` from ${msg.toolName}` : ""}]: ${body}`);
+    }
+  }
+  return parts.join("\n\n");
+}
+
+function extractSdkText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((b) => {
+    if (typeof b === "string") return b;
+    if (b && b.type === "text") return b.text;
+    return "";
+  }).filter(Boolean).join("");
+}
+
+/** Map an SDK/transport error to a short, key-scrubbed, user-facing message. */
+function sanitizeSdkError(error, apiKey) {
+  let message = error && error.message ? String(error.message) : String(error);
+  if (apiKey && message.includes(apiKey)) message = message.split(apiKey).join("***");
+  const lower = message.toLowerCase();
+  const name = (error && error.constructor && error.constructor.name) || "";
+  if (/auth|401|unauthor|api key|apikey/.test(lower) || name === "AuthenticationError") {
+    return "Authentication failed. Set a Cursor API key via /login or CURSOR_API_KEY.";
+  }
+  if (/network|fetch failed|econn|timeout|socket/.test(lower) || name === "NetworkError") {
+    return "Network error reaching Cursor — check connectivity and try again.";
+  }
+  if (/quota|rate|429/.test(lower) || name === "RateLimitError") {
+    return "Rate limited or quota exceeded. Check your Cursor subscription.";
+  }
+  return `Cursor SDK error: ${message}`;
+}
+
+// ─── Pi → Cursor tool bridge (cross-turn live run) ───────────────────────────
+//
+// Pi's tool protocol is cross-turn: the provider emits toolCall blocks + a
+// done(reason:"toolUse") to END a turn, Pi runs the tool (with approval/UI),
+// then re-invokes streamSimple with a ToolResultMessage. But the SDK agent runs
+// its whole loop INSIDE one agent.send(), surfacing tools via customTool.execute
+// callbacks that must return inline. We reconcile the two by keeping a single
+// agent.send() ALIVE across multiple streamSimple calls (a "live run"): when the
+// agent calls a bridged tool, execute() returns a Promise that stays pending; we
+// emit the Pi toolCall, end the current stream with done(toolUse), and resolve
+// that Promise on the NEXT streamSimple call once Pi delivers the toolResult.
+// (Verified: agent.send tolerates a multi-second-pending execute.)
+//
+// Scope/limits (v1): parallel tool calls are batched only within one microtask
+// tick; the SDK's built-in tools can't be disabled, so we steer the model to the
+// pi_* tools via prompt (best-effort, like the reference project); one pending
+// tool-set per session.
+
+/** @type {Map<string, object>} sessionKey → live run state */
+const cursorLiveRuns = new Map();
+
+function bridgeSessionKey(options) {
+  return (options && options.sessionId) || "__cursor_sdk_default__";
+}
+
+/** Steering text so the model prefers the bridged Pi tools over built-ins. */
+function bridgeSteeringPreamble(toolNames) {
+  return [
+    "## Environment",
+    "You are running inside Pi. The following tools execute in the user's actual",
+    "environment through Pi, with the user's approval:",
+    toolNames.map((n) => `  - ${n}`).join("\n"),
+    "ALWAYS use these tools for file reads/writes/edits, shell commands, and code",
+    "search. Do NOT use any built-in equivalents — only the tools listed above act",
+    "on the real workspace.",
+    "",
+  ].join("\n");
+}
+
+/** Collect the trailing contiguous block of toolResult messages from context. */
+function getTrailingToolResults(context) {
+  const out = [];
+  const msgs = (context && context.messages) || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === "toolResult") out.unshift(msgs[i]);
+    else if (out.length) break;
+  }
+  return out;
+}
+
+function toolResultToString(msg) {
+  if (typeof msg.content === "string") return msg.content;
+  return extractSdkText(msg.content);
+}
+
+/** Build SDK customTools from Pi's active tools; each routes through Pi. */
+function buildBridgeCustomTools(liveRun, tools) {
+  const customTools = {};
+  for (const tool of tools) {
+    if (!tool || !tool.name) continue;
+    const customName = `pi_${tool.name}`;
+    liveRun.toolNameMap.set(customName, tool.name);
+    customTools[customName] = {
+      description: tool.description || `Pi tool: ${tool.name}`,
+      inputSchema: tool.parameters || { type: "object" },
+      execute: (args, ctx) => bridgeExecute(liveRun, tool.name, args, ctx),
+    };
+  }
+  return customTools;
+}
+
+/**
+ * Called by the SDK agent when it invokes a bridged tool. Registers the call and
+ * schedules it to be surfaced to Pi; returns a Promise that resolves once Pi
+ * delivers the tool result on a later streamSimple call.
+ */
+function bridgeExecute(liveRun, piToolName, args, ctx) {
+  const toolCallId = (ctx && ctx.toolCallId) || `bridge-${liveRun.callSeq++}`;
+  const d = sdkDeferred();
+  liveRun.pendingTools.set(toolCallId, { d, piToolName, args, surfaced: false });
+  scheduleSurface(liveRun);
+  return d.promise;
+}
+
+/** Surface pending tools to Pi on the next microtask (batches same-tick calls). */
+function scheduleSurface(liveRun) {
+  if (liveRun.flushScheduled) return;
+  liveRun.flushScheduled = true;
+  queueMicrotask(() => {
+    liveRun.flushScheduled = false;
+    surfacePendingTools(liveRun);
+  });
+}
+
+/**
+ * Emit a Pi toolCall for every not-yet-surfaced pending tool and end the current
+ * turn with done(toolUse). No-op when there's no active turn — those tools stay
+ * pending and are surfaced by the next resume (so a tool issued after a turn
+ * already ended is never stranded, which would otherwise deadlock the agent).
+ */
+function surfacePendingTools(liveRun) {
+  if (liveRun.settled || !liveRun.resolveTurn) return;
+  let surfacedAny = false;
+  for (const [id, p] of liveRun.pendingTools) {
+    if (!p.surfaced) {
+      liveRun.emitter.emitToolCall(id, p.piToolName, p.args);
+      p.surfaced = true;
+      surfacedAny = true;
+    }
+  }
+  if (!surfacedAny) return;
+  liveRun.partial.stopReason = "toolUse";
+  liveRun.stream.push({ type: "done", reason: "toolUse", message: liveRun.partial });
+  const resolveTurn = liveRun.resolveTurn;
+  liveRun.resolveTurn = null;
+  resolveTurn();
+}
+
+function handleBridgeDelta(liveRun, update) {
+  switch (update.type) {
+    case "text-delta": liveRun.emitter.appendText(update.text); break;
+    case "thinking-delta": liveRun.emitter.appendThinking(update.text); break;
+    case "thinking-completed": liveRun.emitter.closeThinking(); break;
+    case "turn-ended": if (update.usage) liveRun.lastUsage = update.usage; break;
+    default: break; // tool-call-* deltas are emitted by bridgeExecute, not here
+  }
+}
+
+/** Finalize the whole live run (agent.send settled) onto the current stream. */
+function finalizeBridge(liveRun, sessionKey, result, error, apiKey) {
+  if (liveRun.settled) return;
+  liveRun.settled = true;
+  cursorLiveRuns.delete(sessionKey);
+  for (const [, p] of liveRun.pendingTools) { try { p.d.reject(makeSdkAbort()); } catch {} }
+  liveRun.pendingTools.clear();
+  if (liveRun.agent) { try { liveRun.agent.close(); } catch { /* best effort */ } }
+
+  const { stream, emitter, partial } = liveRun;
+  if (liveRun.aborted || (result && result.status === "cancelled")) {
+    finalizeSdkAbort(stream, emitter, partial);
+  } else if (error || (result && result.status === "error")) {
+    emitter.closeThinking();
+    emitter.closeText();
+    partial.stopReason = "error";
+    partial.errorMessage = sanitizeSdkError(error || new Error((result && result.error) || "Cursor SDK run failed"), apiKey);
+    stream.push({ type: "error", reason: "error", error: partial });
+  } else {
+    const streamed = emitter.currentText();
+    const finalText = (result && result.result) || "";
+    if (finalText && finalText.length > streamed.length && finalText.startsWith(streamed)) {
+      emitter.appendText(finalText.slice(streamed.length));
+    } else if (finalText && !streamed) {
+      emitter.appendText(finalText);
+    }
+    emitter.closeThinking();
+    emitter.closeText();
+    applySdkUsage(partial, liveRun.lastUsage);
+    partial.stopReason = "stop";
+    stream.push({ type: "done", reason: "stop", message: partial });
+  }
+  const rt = liveRun.resolveTurn;
+  liveRun.resolveTurn = null;
+  if (rt) rt();
+}
+
+/** Start a fresh live run: create the agent and kick off agent.send(). */
+async function startBridgeRun(sessionKey, stream, model, context, options) {
+  const partial = makeSdkInitialMessage(model);
+  stream.push({ type: "start", partial });
+  const emitter = new SdkPartialEmitter(stream, partial);
+
+  const apiKey = resolveSdkApiKey(options && options.apiKey);
+  if (!apiKey) {
+    partial.stopReason = "error";
+    partial.errorMessage = "No Cursor API key. Run /login or set CURSOR_API_KEY.";
+    stream.push({ type: "error", reason: "error", error: partial });
+    return;
+  }
+  const sdk = await loadCursorSdk();
+  if (!sdk) {
+    partial.stopReason = "error";
+    partial.errorMessage = "@cursor/sdk is not installed.";
+    stream.push({ type: "error", reason: "error", error: partial });
+    return;
+  }
+
+  const turn = sdkDeferred();
+  const liveRun = {
+    agent: null, run: null, sendPromise: null,
+    stream, partial, emitter, resolveTurn: turn.resolve,
+    pendingTools: new Map(), toolNameMap: new Map(),
+    flushScheduled: false, callSeq: 0, lastUsage: null,
+    settled: false, aborted: false,
+  };
+  cursorLiveRuns.set(sessionKey, liveRun);
+
+  const tools = (context && context.tools) || [];
+  const customTools = buildBridgeCustomTools(liveRun, tools);
+  const customNames = Object.keys(customTools);
+  const hasTools = customNames.length > 0;
+
+  const selection = buildCursorModelSelection(model.id, options && options.reasoning);
+  const prompt = hasTools
+    ? `${bridgeSteeringPreamble(customNames)}\n${buildSdkPrompt(context)}`
+    : buildSdkPrompt(context);
+
+  const signal = options && options.signal;
+  const onAbort = () => {
+    liveRun.aborted = true;
+    for (const [, d] of liveRun.pendingTools) { try { d.reject(makeSdkAbort()); } catch {} }
+    if (liveRun.run) liveRun.run.cancel().catch(() => {});
+  };
+  if (signal) {
+    if (signal.aborted) { liveRun.aborted = true; }
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+
+  if (liveRun.aborted) { finalizeBridge(liveRun, sessionKey, null, makeSdkAbort(), apiKey); await turn.promise; return; }
+
+  try {
+    liveRun.agent = await sdk.Agent.create({
+      apiKey,
+      model: selection,
+      mode: "agent",
+      local: hasTools ? { cwd: backendCwd, customTools } : { cwd: backendCwd },
+    });
+    liveRun.sendPromise = liveRun.agent.send({ text: prompt }, {
+      onDelta: ({ update }) => handleBridgeDelta(liveRun, update),
+    });
+    // The whole agentic loop (spanning tool turns) completes here.
+    liveRun.sendPromise
+      .then(async (run) => {
+        liveRun.run = run;
+        const result = await run.wait();
+        finalizeBridge(liveRun, sessionKey, result, null, apiKey);
+      })
+      .catch((err) => finalizeBridge(liveRun, sessionKey, null, err, apiKey));
+  } catch (err) {
+    finalizeBridge(liveRun, sessionKey, null, err, apiKey);
+  }
+
+  await turn.promise;
+}
+
+/** Resume an in-flight live run: deliver tool results, continue streaming. */
+async function resumeBridgeRun(liveRun, stream, context, model) {
+  const partial = makeSdkInitialMessage(model);
+  stream.push({ type: "start", partial });
+  const emitter = new SdkPartialEmitter(stream, partial);
+
+  const turn = sdkDeferred();
+  liveRun.stream = stream;
+  liveRun.partial = partial;
+  liveRun.emitter = emitter;
+  liveRun.resolveTurn = turn.resolve;
+  liveRun.flushScheduled = false;
+
+  // Deliver the tool results Pi just produced to the waiting agent.
+  const results = getTrailingToolResults(context);
+  for (const tr of results) {
+    const p = liveRun.pendingTools.get(tr.toolCallId);
+    if (p) { liveRun.pendingTools.delete(tr.toolCallId); p.d.resolve(toolResultToString(tr)); }
+  }
+
+  // If tools issued after the previous turn ended are still un-surfaced, surface
+  // them now (prevents the agent deadlocking on a tool Pi never saw). The
+  // microtask gives the agent a chance to issue follow-up tools first.
+  queueMicrotask(() => surfacePendingTools(liveRun));
+
+  await turn.promise;
+}
+
+/**
+ * Pi streamSimple entry point for the SDK backend. Dispatches to a fresh run or
+ * resumes an in-flight live run (when the agent is awaiting tool results).
+ */
+function streamCursorSdk(model, context, options) {
+  const stream = createAssistantMessageEventStream();
+  const sessionKey = bridgeSessionKey(options);
+
+  (async () => {
+    const existing = cursorLiveRuns.get(sessionKey);
+    if (existing && !existing.settled && existing.pendingTools.size > 0) {
+      await resumeBridgeRun(existing, stream, context, model);
+    } else {
+      await startBridgeRun(sessionKey, stream, model, context, options);
+    }
+  })().catch((error) => {
+    const partial = makeSdkInitialMessage(model);
+    partial.stopReason = "error";
+    partial.errorMessage = sanitizeSdkError(error, resolveSdkApiKey(options && options.apiKey) || "");
+    try { stream.push({ type: "error", reason: "error", error: partial }); } catch {}
+  }).finally(() => {
+    stream.end();
+  });
+
+  return stream;
+}
+
+function applySdkUsage(partial, usage) {
+  if (usage) {
+    partial.usage.input = usage.inputTokens ?? 0;
+    partial.usage.output = usage.outputTokens ?? 0;
+    partial.usage.cacheRead = usage.cacheReadTokens ?? 0;
+    partial.usage.cacheWrite = usage.cacheWriteTokens ?? 0;
+  } else {
+    let outChars = 0;
+    for (const block of partial.content) {
+      if (block.type === "text") outChars += block.text.length;
+      else if (block.type === "thinking") outChars += block.thinking.length;
+    }
+    partial.usage.output = estimateSdkTokens(" ".repeat(outChars));
+  }
+  partial.usage.totalTokens = partial.usage.input + partial.usage.output + partial.usage.cacheRead + partial.usage.cacheWrite;
+}
+
+function finalizeSdkAbort(stream, emitter, partial) {
+  emitter.closeThinking();
+  emitter.closeText();
+  partial.stopReason = "aborted";
+  partial.errorMessage = "Cancelled.";
+  stream.push({ type: "error", reason: "aborted", error: partial });
+}
+
+function makeSdkAbort() {
+  const e = new Error("aborted");
+  e.name = "AbortError";
+  return e;
+}
+
+function isSdkAbort(error) {
+  return error && (error.name === "AbortError" || /abort/i.test(String(error.message || "")));
+}
+
+// ─── Provider registration ────────────────────────────────────────────────────
+
 function registerCursorProvider(pi, modelConfigs) {
   pi.registerProvider(PROVIDER_ID, {
     name: "Cursor Agent",
@@ -1478,10 +2226,167 @@ function registerCursorProvider(pi, modelConfigs) {
   });
 }
 
+/**
+ * Set to "1" to force the CLI/proxy backend even when @cursor/sdk is installed.
+ * Use if the SDK path misbehaves (e.g. wrong Node version).
+ */
+const DISABLE_SDK_BACKEND = process.env.PI_CURSOR_SDK_DISABLE === "1";
+
+/**
+ * Register the provider against the @cursor/sdk backend (Phase 7).
+ *
+ * Unlike the proxy provider, this routes Pi turns through `streamCursorSdk`
+ * directly — no HTTP, no effort-baked model IDs, so the family-collapse routing
+ * bug cannot occur. Pi requires `baseUrl` and `apiKey` even for a custom
+ * `streamSimple` provider, so we pass inert placeholders; the real key is
+ * resolved inside the stream function via setCursorSdkAuthKey()/CURSOR_API_KEY.
+ */
+function registerCursorSdkProvider(pi, modelConfigs) {
+  pi.registerProvider(PROVIDER_ID, {
+    name: "Cursor Agent",
+    baseUrl: `http://${HOST}:${PORT}/v1`, // inert: SDK path bypasses HTTP
+    apiKey: "$PI_CURSOR_AGENT_API_KEY",
+    api: CURSOR_SDK_API,
+    authHeader: false,
+    streamSimple: streamCursorSdk,
+    models: modelConfigs,
+    compat: {
+      supportsDeveloperRole: true,
+      supportsReasoningEffort: true,
+      maxTokensField: "max_tokens",
+      supportsUsageInStreaming: true,
+    },
+  });
+}
+
+/**
+ * Try to register the SDK-backed provider. Returns the model count on success,
+ * or null when the SDK is disabled/unavailable/keyless or discovery fails (in
+ * which case the caller falls back to the CLI/proxy provider — no regression).
+ */
+/**
+ * Live status, surfaced by /cursor-status and the startup log. The backend
+ * selection is otherwise silent (SDK → CLI fallback has several causes), so
+ * tracking the chosen backend + WHY is the high-value diagnostic.
+ */
+const cursorStatus = {
+  backend: "unknown",   // "@cursor/sdk" | "CLI/proxy" | "disabled"
+  reason: "not initialized",
+  modelCount: 0,
+  modelSource: "",      // "SDK discovery" | "cursor-agent CLI" | "disk cache" | ...
+  proxy: "",            // "http://host:port (owned|peer)" | "disabled"
+};
+
+/**
+ * Resolve the installed @cursor/sdk version (best-effort), or null.
+ * The package blocks `@cursor/sdk/package.json` via its `exports` map, so we
+ * resolve the main entry and walk up to the package root instead.
+ */
+function getSdkVersion() {
+  try {
+    let dir = path.dirname(createRequire(import.meta.url).resolve("@cursor/sdk"));
+    for (let i = 0; i < 6; i++) {
+      const pj = path.join(dir, "package.json");
+      if (fs.existsSync(pj)) {
+        const pkg = JSON.parse(fs.readFileSync(pj, "utf8"));
+        if (pkg.name === "@cursor/sdk") return pkg.version || null;
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch { /* not resolvable */ }
+  return null;
+}
+
+/** Render the current status as display lines (used by command + startup log). */
+function getCursorStatusLines() {
+  const authSource = cachedAuthKey
+    ? "Pi AuthStorage (cursor-agent)"
+    : (process.env.CURSOR_API_KEY ? "CURSOR_API_KEY env" : "none");
+  const sdkVersion = getSdkVersion();
+  const rg = process.env.CURSOR_RIPGREP_PATH;
+  return [
+    `Backend:   ${cursorStatus.backend}`,
+    `Detail:    ${cursorStatus.reason}`,
+    `Models:    ${cursorStatus.modelCount}${cursorStatus.modelSource ? ` (${cursorStatus.modelSource})` : ""}`,
+    `Auth:      ${authSource}`,
+    `Proxy:     ${cursorStatus.proxy || "n/a"}`,
+    `Runtime:   Node ${process.version} | @cursor/sdk ${sdkVersion || "not installed"}`,
+    `Ripgrep:   ${rg || "not configured"}`,
+    `cwd:       ${backendCwd}`,
+    `Live runs: ${cursorLiveRuns.size} active`,
+  ];
+}
+
+/** Compact backend summary for the one-time startup log. */
+function buildStartupLogLines() {
+  const authSource = cachedAuthKey
+    ? "Pi AuthStorage (cursor-agent)"
+    : (process.env.CURSOR_API_KEY ? "CURSOR_API_KEY env" : "none");
+  const sdkVersion = getSdkVersion();
+  const lines = [
+    `Backend: ${cursorStatus.backend} (${cursorStatus.modelCount} models${cursorStatus.modelSource ? `, ${cursorStatus.modelSource}` : ""})`,
+  ];
+  // When NOT on the SDK backend, say why — that's the actionable bit.
+  if (cursorStatus.backend !== "@cursor/sdk") {
+    lines.push(`SDK inactive: ${cursorStatus.reason}`);
+  }
+  lines.push(`Auth: ${authSource} | Node ${process.version} | @cursor/sdk ${sdkVersion || "not installed"}`);
+  if (cursorStatus.proxy) lines.push(`Proxy: ${cursorStatus.proxy}`);
+  lines.push(`Run /cursor-status for details`);
+  return lines;
+}
+
+/**
+ * Try to register the SDK-backed provider. Returns the model count on success,
+ * else null (caller falls back to CLI/proxy). Records the reason into
+ * cursorStatus either way so /cursor-status can explain the choice.
+ */
+async function tryRegisterSdkProvider(pi) {
+  if (DISABLE_SDK_BACKEND) { cursorStatus.reason = "SDK disabled via PI_CURSOR_SDK_DISABLE=1"; return null; }
+  if (!cachedAuthKey) { cursorStatus.reason = "no Cursor API key resolved (run /login)"; return null; }
+  try {
+    if (!(await isCursorSdkAvailable())) {
+      cursorStatus.reason = "@cursor/sdk not importable (run npm install / check the extensions node_modules)";
+      return null;
+    }
+    setCursorSdkAuthKey(cachedAuthKey);
+    const sdkModels = await discoverSdkModels(cachedAuthKey);
+    const { configs, count } = buildSdkModelConfigs(sdkModels);
+    if (count === 0) { cursorStatus.reason = "SDK returned 0 models"; return null; }
+    registerCursorSdkProvider(pi, configs);
+    cursorStatus.backend = "@cursor/sdk";
+    cursorStatus.reason = "SDK active";
+    cursorStatus.modelCount = count;
+    cursorStatus.modelSource = "SDK discovery";
+    return { count };
+  } catch (e) {
+    cursorStatus.reason = `SDK discovery failed: ${(e && e.message) || e}`;
+    return null; // fall through to CLI/proxy backend
+  }
+}
+
 export default async function (pi) {
+  // The local @cursor/sdk leaks internal async rejections during agent
+  // init/cancel (e.g. initializeIgnoreMapping's RxJS pipeline). Without a
+  // handler these can crash the host or print scary stacks. Swallow ONLY
+  // SDK-originated rejections; re-surface anything else so real bugs aren't
+  // hidden. Registered once (reload-safe) to avoid accumulating handlers.
+  if (!globalThis.__piCursorSdkRejectionGuard) {
+    globalThis.__piCursorSdkRejectionGuard = true;
+    process.on("unhandledRejection", (reason) => {
+      const stack = String((reason && reason.stack) || reason || "");
+      if (stack.includes("@cursor/sdk")) return; // known benign SDK leak
+      console.error("[cursor-agent] unhandled rejection:", reason);
+    });
+  }
   scheduleStartupLog(pi);
 
   if (process.env.PI_CURSOR_AGENT_DISABLE === "1") {
+    cursorStatus.backend = "disabled";
+    cursorStatus.reason = "PI_CURSOR_AGENT_DISABLE=1";
+    cursorStatus.proxy = "disabled";
     startupLog = { lines: ["Disabled via PI_CURSOR_AGENT_DISABLE=1"] };
     return;
   }
@@ -1506,7 +2411,7 @@ export default async function (pi) {
   // references getModels(), buildModelConfigs(), and registerCursorProvider()
   // which are all defined later in this closure but accessible at call time.
   pi.registerCommand("cursor-refresh-models", {
-    description: "Refresh the cursor-agent model list from the CLI",
+    description: "Refresh the Cursor model list (re-discovers via the active SDK or CLI backend)",
     handler: async (_args, ctx) => {
       // 1. Clear disk cache
       try { fs.unlinkSync(getCacheFilePath()); } catch {}
@@ -1518,21 +2423,34 @@ export default async function (pi) {
       globalThis.__variantMap = {};
       globalThis.__modelContextWindows = {};
 
-      // 3. Re-fetch from CLI (disk cache cleared, so getModels will hit CLI)
+      // 3. Re-register. Prefer the SDK backend (re-discovers its catalog);
+      //    otherwise re-fetch from the CLI (disk cache cleared → hits CLI).
       try {
-        const freshModels = await getModels();
-        const modelConfigs = buildModelConfigs(freshModels);
-        registerCursorProvider(pi, modelConfigs);
+        const sdkResult = await tryRegisterSdkProvider(pi);
+        let count;
+        let via;
+        if (sdkResult) {
+          count = sdkResult.count;
+          via = "@cursor/sdk";
+        } else {
+          const freshModels = await getModels();
+          const modelConfigs = buildModelConfigs(freshModels);
+          registerCursorProvider(pi, modelConfigs);
+          count = modelConfigs.length;
+          via = "cursor-agent CLI";
+          cursorStatus.backend = "CLI/proxy";
+          cursorStatus.modelCount = count;
+          cursorStatus.modelSource = "cursor-agent CLI";
+        }
 
-        const count = freshModels.length;
         if (ctx.hasUI) {
           pi.sendMessage({
             customType: "cursor-agent",
-            content: `Refreshed ${count} cursor-agent models`,
+            content: `Refreshed ${count} models via ${via}`,
             display: true,
           });
         } else {
-          console.log(`[cursor-agent] Refreshed ${count} models`);
+          console.log(`[cursor-agent] Refreshed ${count} models via ${via}`);
         }
       } catch (err) {
         const msg = `Failed to refresh models: ${err.message}`;
@@ -1548,6 +2466,24 @@ export default async function (pi) {
       }
     },
   });
+
+  // Report the active backend (SDK vs CLI/proxy), why, model source, auth,
+  // proxy, runtime, and in-flight tool-bridge runs. Backend selection is
+  // otherwise silent, so this is the go-to diagnostic.
+  pi.registerCommand("cursor-status", {
+    description: "Show Cursor backend status (SDK vs CLI, models, auth, proxy)",
+    handler: async (_args, ctx) => {
+      const content = `Cursor Agent — status\n${getCursorStatusLines().map((l) => `  ${l}`).join("\n")}`;
+      if (ctx.hasUI) {
+        pi.sendMessage({ customType: "cursor-agent", content, display: true });
+      } else {
+        console.log(`[cursor-agent]\n${content}`);
+      }
+    },
+  });
+
+  // Read stored API key from Pi's AuthStorage at startup
+  extractAuthKey();
 
   async function getModels() {
     // Disk cache read: only on first call per extension lifecycle
@@ -1623,16 +2559,22 @@ export default async function (pi) {
    * /model instead of failing with EADDRINUSE.
    */
   async function attachToExistingProxy(reason) {
+    // The SDK backend is per-process and port-independent, so prefer it even
+    // when another instance owns the proxy port.
+    cursorStatus.proxy = `http://${HOST}:${PORT}/v1 (peer)`;
+    const sdkResult = await tryRegisterSdkProvider(pi);
+    if (sdkResult) {
+      startupLog = { lines: buildStartupLogLines() };
+      return true;
+    }
     try {
       const peerModels = await fetchPeerModels();
       const modelConfigs = buildModelConfigs(peerModels);
       registerCursorProvider(pi, modelConfigs);
-      startupLog = {
-        lines: [
-          `Attached to existing proxy at http://${HOST}:${PORT}/v1 (${reason})`,
-          `Registered ${modelConfigs.length} models with Pi`,
-        ],
-      };
+      cursorStatus.backend = "CLI/proxy (peer)";
+      cursorStatus.modelCount = modelConfigs.length;
+      cursorStatus.modelSource = "peer proxy";
+      startupLog = { lines: buildStartupLogLines() };
       return true;
     } catch (err) {
       // Try disk cache as fallback when peer models unavailable
@@ -1645,13 +2587,10 @@ export default async function (pi) {
           }));
           const modelConfigs = buildModelConfigs(models);
           registerCursorProvider(pi, modelConfigs);
-          startupLog = {
-            lines: [
-              `Attached to existing proxy at http://${HOST}:${PORT}/v1 (${reason})`,
-              `Registered ${modelConfigs.length} models with Pi`,
-              `Loaded ${modelConfigs.length} models from disk cache (peer models unavailable)`,
-            ],
-          };
+          cursorStatus.backend = "CLI/proxy (peer)";
+          cursorStatus.modelCount = modelConfigs.length;
+          cursorStatus.modelSource = "disk cache (peer unavailable)";
+          startupLog = { lines: buildStartupLogLines() };
           return true;
         }
       }
@@ -1685,26 +2624,26 @@ export default async function (pi) {
       server.listen(PORT, HOST);
     });
 
-    const models = await getModels();
-    const modelConfigs = buildModelConfigs(models);
-    registerCursorProvider(pi, modelConfigs);
+    cursorStatus.proxy = `http://${HOST}:${PORT}/v1 (owned)`;
 
-    const logLines = [
-      `Proxy server running on http://${HOST}:${PORT}/v1`,
-      `Registered ${modelConfigs.length} models with Pi`,
-    ];
-    if (modelsCacheOrigin === "disk") {
-      logLines.push(`Loaded ${models.length} models from disk cache`);
-    } else if (modelsCacheOrigin === "cli") {
-      if (!DISABLE_MODEL_CACHE) {
-        logLines.push(`Discovered ${models.length} models via cursor-agent CLI, cached to disk`);
-      }
-    } else if (modelsCacheOrigin === "stale-disk") {
-      logLines.push(`Loaded ${models.length} models from stale disk cache (CLI unavailable)`);
-    } else if (modelsCacheOrigin === "fallback") {
-      logLines.push(`Using built-in fallback list (${models.length} models) \u2014 CLI unavailable`);
+    // Prefer the @cursor/sdk backend for Pi (reliable structured model routing).
+    // The proxy server above keeps running for non-Pi OpenAI clients regardless.
+    const sdkResult = await tryRegisterSdkProvider(pi);
+
+    if (!sdkResult) {
+      const models = await getModels();
+      const modelConfigs = buildModelConfigs(models);
+      registerCursorProvider(pi, modelConfigs);
+      cursorStatus.backend = "CLI/proxy";
+      cursorStatus.modelCount = modelConfigs.length;
+      cursorStatus.modelSource =
+        modelsCacheOrigin === "disk" ? "disk cache"
+        : modelsCacheOrigin === "cli" ? "cursor-agent CLI"
+        : modelsCacheOrigin === "stale-disk" ? "stale disk cache"
+        : modelsCacheOrigin === "fallback" ? "built-in fallback"
+        : "cursor-agent CLI";
     }
-    startupLog = { lines: logLines };
+    startupLog = { lines: buildStartupLogLines() };
   } catch (err) {
     // Race: another Pi instance bound the port between our probe and
     // our listen(). Fall back to client-only mode so the user still

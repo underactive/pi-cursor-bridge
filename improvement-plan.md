@@ -166,22 +166,39 @@
 
 ## Phase 7 (stretch) — Adopt `@cursor/sdk` as an optional backend
 
-**Goal.** Offer a second backend path that uses `@cursor/sdk` directly for Pi-native provider sessions, while the HTTP proxy path remains for non-Pi clients. This is the big re-architecture.
+**Status:** v1 complete & VERIFIED IN PI (2026-06-16). Direct text+thinking streaming path, validated both in isolation (Node 24 harness) AND end-to-end through a real `pi -p` run: `cursor-agent/claude-opus-4-6@1m` — the model that previously gave NO reply — now answers reliably (`Registered 38 models with Pi via @cursor/sdk backend`). The CLI bakes effort into model IDs, forcing a lossy family-collapse/re-expand that emits invalid bare model names when a tier is missing (e.g. `claude-4.6-opus` with no `medium` tier → "Cannot use this model" → no reply). The SDK returns clean base IDs (`claude-opus-4-6`) with structured `parameters` (thinking/context/effort/fast), so effort is a `ModelSelection.params` entry and a missing tier is simply omitted — the bug class cannot occur.
 
-**Changes.**
+**Inlined, not a separate module.** Pi loads each extension as a single symlinked `.js` file via jiti, resolving relative imports against the symlink dir — so a sibling `cursor-sdk-backend.js` is unreachable (and would be mis-loaded as its own extension). The backend is therefore inlined into `cursor-agent.js`, matching how `cursor-session.js` was folded in.
 
-1. Add `@cursor/sdk` as an optional dependency (or peer dependency).
-2. Create `extensions/cursor-sdk-backend.js` that implements `streamSimple` using `Cursor.Agent.create()` / `.send()`.
-3. Detect at startup whether the SDK is importable. If yes, register a `cursor` provider (in addition to or replacing `cursor-agent`) with `api: "cursor-sdk"` and the SDK-backed stream function.
-4. If the SDK is not installed, fall back to the existing CLI proxy path. No regression.
+**Ripgrep.** The SDK's workspace ignore-scan shells out to `rg` and auto-locates it relative to `process.argv[1]` — which under jiti is Pi's CLI, not us — so it failed and leaked an async rejection on cold start. Fixed by resolving the binary from `@cursor/sdk-<platform>-<arch>/bin/rg` and setting `CURSOR_RIPGREP_PATH`. A scoped `unhandledRejection` guard swallows any remaining SDK-internal leaks (reload-safe, only `@cursor/sdk`-stack rejections).
 
-**Success criteria.**
+**Dev-setup requirement (symlinked extensions).** When the extension is symlinked into `~/.pi/agent/extensions/` (dev install), jiti resolves bare imports like `@cursor/sdk` from the symlink dir, NOT the repo — so `@cursor/sdk` must be reachable there. Fix: `ln -s <repo>/node_modules ~/.pi/agent/extensions/node_modules` (after `npm install @cursor/sdk` in the repo). For a normally-installed package this is automatic (deps live in the package's own `node_modules`). Without it the backend silently falls back to the CLI/proxy path — no error, just no SDK.
 
-- When `@cursor/sdk` is present, Pi uses the SDK-backed provider with native thinking mapping, tool replay, and structured model metadata.
-- When `@cursor/sdk` is absent, the existing proxy path works exactly as before.
-- The HTTP proxy stays running in both modes so non-Pi clients keep working.
+**Goal.** Offer a second backend path that uses `@cursor/sdk` directly for Pi-native provider sessions, while the HTTP proxy path remains for non-Pi clients.
 
-**Files touched.** New `extensions/cursor-sdk-backend.js`, modified `extensions/cursor-agent.js` to conditionally use it. `package.json` — add `@cursor/sdk` as optional dependency.
+**Changes (as implemented).**
+
+1. Added `@cursor/sdk` as an `optionalDependency` and `@earendil-works/pi-ai` as a `peerDependency` (needed for `createAssistantMessageEventStream`).
+2. Created `extensions/cursor-sdk-backend.js` implementing `streamSimple` (`streamCursorSdk`) via `Cursor.models.list()` + `Agent.create()` + `agent.send({onDelta})` + `run.wait()`.
+3. At startup `tryRegisterSdkProvider()` registers the provider with `api: "cursor-sdk"` + `streamSimple` when the SDK imports AND an API key is resolved; the `session_start` handler threads `cwd` into the backend (Pi does not pass cwd to `streamSimple`).
+4. Falls back to the CLI/proxy `openai-completions` provider when the SDK is unavailable/keyless/errors. The HTTP proxy keeps running for non-Pi clients. `PI_CURSOR_SDK_DISABLE=1` forces the CLI path.
+
+**Deviations from the original sketch (intentional).**
+
+- Registered under the **same** provider id (`cursor-agent`) rather than a new `cursor` provider, so the model picker doesn't show duplicate Cursor entries. The SDK backend *replaces* the Pi-facing registration; the proxy still serves external OpenAI clients.
+- Use **real** `turn-ended` token usage instead of the sibling's char-based estimate (the SDK reports it).
+- **Runtime:** the SDK uses `@connectrpc/connect-node` + a native binary. Verified working on Node 24 AND Node 26 (pi runs under `#!/usr/bin/env node`, i.e. whatever node is on PATH). Transient transport `NetworkError`s are possible; any discovery failure falls through to the CLI path, so it degrades gracefully. (An early `NetworkError` was a one-off network blip, not a node-version issue.)
+
+**Pi→Cursor tool bridge — DONE & verified in Pi (2026-06-16).** Pi's active tools (`context.tools`) are exposed to the Cursor agent as in-process SDK `customTools` named `pi_<tool>`, with a steering preamble so the model prefers them. When the agent calls one, a **cross-turn live run** keeps the single `agent.send()` alive across `streamSimple` calls: the bridge emits the Pi `toolCall` + `done(reason:"toolUse")` to end the turn, Pi executes the tool through its own pipeline (approval/permissions/rendering), and the next `streamSimple` resumes the run by resolving the pending `execute()` Promise with the `ToolResultMessage`. Verified: `claude-opus-4-6` called Pi's `ls`/`read` and answered correctly; when it tried `edit`/`write` outside the `--tools` allowlist, **Pi blocked them** (no files changed) — proving bridged calls are governed by Pi, not Cursor. No MCP server / extra dependency needed (simpler than the reference's MCP bridge). Verified the SDK tolerates a multi-second-pending `execute` (the cross-turn gap). Tool surfacing is deferred-and-batched so a tool issued after a turn ends is re-surfaced on resume (no deadlock).
+
+**Backlog (deferred, in priority order).**
+
+1. Agent pooling + incremental sends (v1 creates a fresh agent per turn and sends full history — correct but not token-optimal).
+2. Native tool-call display replay (render Cursor's *own* tool calls — when it bypasses the bridge — as Pi `toolCall` blocks instead of activity text).
+3. Robustness: truly-parallel (cross-tick) tool calls are surfaced across turns but not co-batched into one turn; per-session single live-run only; SDK built-in tools can't be hard-disabled (bridge steering is best-effort).
+4. Image input; `fast` variant exposure. (`/cursor-refresh-models` is already SDK-aware.)
+
+**Files touched.** `extensions/cursor-agent.js` — SDK backend + tool bridge inlined (`streamCursorSdk`, `startBridgeRun`/`resumeBridgeRun`, `bridgeExecute`/`surfacePendingTools`, `registerCursorSdkProvider`, `tryRegisterSdkProvider`, ripgrep config, rejection guard, `session_start` cwd capture, startup/peer-attach/refresh wiring); `package.json` (deps). Dev-setup: `~/.pi/agent/extensions/node_modules` symlink.
 
 ---
 
@@ -195,6 +212,6 @@
 | 4 | `/cursor-refresh-models` | Low | Medium — no reload needed for new models |
 | 5 | Pi-native auth flow | Medium | High — no external CLI login step |
 | 6 | Image input | Low | Medium — image support in chat |
-| 7 | Optional `@cursor/sdk` backend | High | High — unlocks native tool replay and deep integration |
+| 7 | Optional `@cursor/sdk` backend | High | High — fixes model-routing reliability, unlocks deep integration | ✅ v1 (text+thinking) Complete |
 
 Phases 1-4 are the highest-value-per-effort. Phase 5 is the biggest UX improvement for Pi-native feel. Phase 7 is a major re-architecture that preserves the proxy for non-Pi clients while gaining `pi-cursor-sdk`-level integration.
