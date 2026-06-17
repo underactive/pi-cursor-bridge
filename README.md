@@ -104,6 +104,25 @@ The proxy server starts (or attaches to a peer instance) regardless of which bac
 
 Set `PI_CURSOR_SDK_DISABLE=1` to force CLI/proxy mode even when `@cursor/sdk` is installed.
 
+### SDK backend: context gauge
+
+On the SDK backend, Cursor runs its *own* agent loop server-side (its own system
+prompt, its own built-in tool schemas, and the full internal tool-call transcript).
+Two consequences shape what Pi shows:
+
+- **System prompt is stripped by default.** Forwarding Pi's entire system prompt
+  (with its tool docs) on top of Cursor's own system prompt + tool schemas is
+  duplicated context that inflates every turn's input tokens. The bridge replaces
+  it with a minimal preamble (environment + date + cwd). Set
+  `PI_CURSOR_STRIP_SYSTEM_PROMPT=0` to forward the full Pi system prompt instead.
+- **The context gauge reflects Pi's conversation, not Cursor's loop.** Cursor's
+  reported `inputTokens` measure Cursor's whole server-side context, which would
+  make even a one-step turn read as ~80%+ full and could trip premature
+  compaction. The bridge instead reports `totalTokens` as an estimate of the
+  *forwarded* conversation Pi actually holds and can compact. Cursor's real token
+  counts still appear in the footer's token/cost stats (`↑`/`↓`/`R`/`CH%`); only
+  the context-fill gauge is rebased onto Pi's own conversation.
+
 ## Pi commands
 
 - **`/cursor-status`** — active backend, model count/source, auth source, proxy ownership, Node and SDK versions.
@@ -164,6 +183,7 @@ Environment variables (set before Pi loads the extension):
 | --- | --- |
 | `PI_CURSOR_AGENT_DISABLE=1` | Disable extension startup entirely |
 | `PI_CURSOR_SDK_DISABLE=1` | Force CLI/proxy backend instead of `@cursor/sdk` |
+| `PI_CURSOR_STRIP_SYSTEM_PROMPT=0` | **Opt out** of stripping Pi's system prompt on the SDK backend (stripping is ON by default — see [SDK backend: context gauge](#sdk-backend-context-gauge)) |
 | `PI_CURSOR_AGENT_PATH` | Absolute path to a custom `cursor-agent` binary |
 | `CURSOR_API_KEY` | Cursor API key for SDK and CLI spawns |
 | `PI_CURSOR_DISABLE_MODEL_CACHE=1` | Disable on-disk model cache |

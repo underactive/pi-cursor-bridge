@@ -31,7 +31,7 @@ Despite the historical `cursor-acp` name in early commits, this extension does *
 
 Use modern JavaScript ES modules. Match the current style: two-space indentation, semicolons, double quotes, `const` by default, and `camelCase` for functions and variables. Constants such as `PORT`, `HOST`, and `FALLBACK_MODELS` use uppercase names. Prefer small pure helpers for parsing, normalization, and formatting, and keep HTTP response shapes OpenAI-compatible.
 
-New `PI_CURSOR_*` env vars follow the existing pattern: boolean toggles use `=== "1"` checks; multi-word names use snake_case (e.g. `PI_CURSOR_MODEL_CACHE_TTL_MS`).
+New `PI_CURSOR_*` env vars follow the existing pattern: default-off boolean toggles use `=== "1"` checks; default-on toggles are opt-out via `!== "0"` (e.g. `PI_CURSOR_STRIP_SYSTEM_PROMPT`); multi-word names use snake_case (e.g. `PI_CURSOR_MODEL_CACHE_TTL_MS`).
 
 ## Testing Guidelines
 

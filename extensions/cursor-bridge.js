@@ -33,13 +33,13 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 // a STATIC `import "../lib/..."` fails at load. loadSdkHelpers() instead follows
 // this file's realpath back to the repo and dynamic-imports the module. The
 // bindings are populated by loadSdkHelpers() before any request is served.
-let collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError;
+let collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens;
 
 async function loadSdkHelpers() {
   const selfReal = fs.realpathSync(fileURLToPath(import.meta.url));
   const helpersPath = path.join(path.dirname(selfReal), "..", "lib", "cursor-helpers.js");
   const helpers = await import(pathToFileURL(helpersPath).href);
-  ({ collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError } = helpers);
+  ({ collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens } = helpers);
 }
 
 // ─── Session Management ──────────────────────────────────────────────────────
@@ -1812,10 +1812,10 @@ function estimateSdkTokens(text) {
 }
 
 /**
- * Build a minimal context preamble that replaces Pi's full system prompt
- * when PI_CURSOR_STRIP_SYSTEM_PROMPT=1. Keeps only essential context
- * (environment identity + date + cwd) without Pi's tool definitions
- * that overlap with Cursor's SDK system prompt.
+ * Build a minimal context preamble that replaces Pi's full system prompt when
+ * STRIP_SYSTEM_PROMPT is active (the default — see PI_CURSOR_STRIP_SYSTEM_PROMPT).
+ * Keeps only essential context (environment identity + date + cwd) without Pi's
+ * tool definitions that overlap with Cursor's SDK system prompt.
  */
 function buildMinimalPreamble() {
   const now = new Date();
@@ -2075,7 +2075,7 @@ function finalizeBridge(liveRun, sessionKey, result, error, apiKey) {
       }
       emitter.closeThinking();
       emitter.closeText();
-      applySdkUsage(partial, liveRun.lastUsage);
+      applySdkUsage(partial, liveRun.lastUsage, estimatePiContextTokens(liveRun));
       partial.stopReason = "stop";
       stream.push({ type: "done", reason: "stop", message: partial });
     }
@@ -2113,6 +2113,10 @@ async function startBridgeRun(sessionKey, stream, model, context, options) {
     pendingTools: new Map(), toolNameMap: new Map(),
     flushScheduled: false, callSeq: 0, lastUsage: null,
     settled: false, aborted: false,
+    // Latest Pi context for this run, refreshed each turn (start + resume). Used
+    // by estimatePiContextTokens() at finalize to size the gauge off Pi's own
+    // conversation rather than Cursor's internal accounting.
+    lastContext: context,
     // H1/H2: stored so the idle timer and abort handler are self-contained.
     sessionKey, apiKey, idleTimer: null, onAbort: null, abortSignal: null,
   };
@@ -2193,6 +2197,9 @@ async function resumeBridgeRun(liveRun, stream, context, model, options) {
   liveRun.emitter = emitter;
   liveRun.resolveTurn = turn.resolve;
   liveRun.flushScheduled = false;
+  // Refresh the context snapshot — by now it carries the tool results Pi just
+  // produced, so the finalize-time gauge estimate reflects the grown conversation.
+  liveRun.lastContext = context;
 
   // H2: rebind the abort handler to THIS turn's signal so an abort on a resumed
   // turn actually cancels the run and rejects pending tools.
@@ -2248,7 +2255,30 @@ function streamCursorSdk(model, context, options) {
   return stream;
 }
 
-function applySdkUsage(partial, usage) {
+/**
+ * Apply usage to the Pi assistant message.
+ *
+ * The per-field counts (input/output/cacheRead/cacheWrite) are Cursor's REAL
+ * reported numbers and pass through verbatim — Pi's footer sums them for the
+ * token/cost stats (↑input ↓output Rcache CH%), so they must stay accurate.
+ *
+ * `totalTokens` is treated separately. Pi derives BOTH its context-fill gauge and
+ * its auto-compaction trigger from calculateContextTokens(usage), which is
+ * `usage.totalTokens || sum(fields)`. Cursor's reported input reflects Cursor's
+ * OWN server-side agent context (its large system prompt + built-in tool schemas +
+ * the entire internal tool-loop transcript), not the conversation Pi holds and
+ * resends — so a one-step turn reads ~83% full and can trip premature compaction
+ * that can't even shrink the offending tokens (they live on Cursor's side). We
+ * therefore set totalTokens to a Pi-side estimate of the actual forwarded
+ * conversation (see estimatePiContextTokens) so the gauge tracks the compactable
+ * context. When no estimate is supplied (or it's empty) we fall back to the field
+ * sum, preserving the previous behavior.
+ *
+ * @param {object} partial — the Pi AssistantMessage being finalized
+ * @param {object|null} usage — Cursor's turn-ended usage (inputTokens, …)
+ * @param {number} [contextTokens] — Pi-side conversation estimate for the gauge
+ */
+function applySdkUsage(partial, usage, contextTokens) {
   if (usage) {
     partial.usage.input = usage.inputTokens ?? 0;
     partial.usage.output = usage.outputTokens ?? 0;
@@ -2262,7 +2292,29 @@ function applySdkUsage(partial, usage) {
     }
     partial.usage.output = estimateSdkTokens(" ".repeat(outChars));
   }
-  partial.usage.totalTokens = partial.usage.input + partial.usage.output + partial.usage.cacheRead + partial.usage.cacheWrite;
+  partial.usage.totalTokens = (typeof contextTokens === "number" && contextTokens > 0)
+    ? contextTokens
+    : partial.usage.input + partial.usage.output + partial.usage.cacheRead + partial.usage.cacheWrite;
+}
+
+/**
+ * Estimate the tokens of Pi's OWN conversation for this turn: the forwarded
+ * system/preamble + messages + tool results (buildSdkPrompt) plus this turn's
+ * model output. Uses the same chars/4 heuristic Pi's own estimateTokens() uses,
+ * and counts assistant output blocks (text + thinking + toolCall name/args)
+ * exactly as Pi does, so the gauge doesn't jump when this message later becomes a
+ * "trailing" message in Pi's estimate.
+ *
+ * Deliberately EXCLUDES Cursor's opaque server-side baseline (its system prompt +
+ * built-in tool schemas + internal tool-loop transcript): Pi can neither see,
+ * control, nor compact those tokens, so counting them would only mislead the
+ * gauge and mis-fire compaction. When STRIP_SYSTEM_PROMPT is on (the default),
+ * buildSdkPrompt already reflects the minimal preamble, so the estimate naturally
+ * tracks the smaller forwarded payload.
+ */
+function estimatePiContextTokens(liveRun) {
+  const promptText = liveRun.lastContext ? buildSdkPrompt(liveRun.lastContext) : "";
+  return estimateConversationTokens(promptText, liveRun.partial.content, SDK_APPROX_CHARS_PER_TOKEN);
 }
 
 function finalizeSdkAbort(stream, emitter, partial) {
@@ -2309,15 +2361,22 @@ function registerCursorProvider(pi, modelConfigs) {
 const DISABLE_SDK_BACKEND = process.env.PI_CURSOR_SDK_DISABLE === "1";
 
 /**
- * Set to "1" to strip Pi's system prompt from the SDK agent prompt, relying
- * on Cursor's SDK system prompt for agent behavior instructions instead.
- * Pi tool bridging (the bridgeSteeringPreamble) is unaffected and still
- * tells the model which Pi tools to use.
+ * Strip Pi's system prompt from the SDK agent prompt, relying on Cursor's own
+ * SDK system prompt for agent behavior instructions instead. Pi tool bridging
+ * (the bridgeSteeringPreamble) is unaffected and still tells the model which Pi
+ * tools to use.
  *
- * When active, buildSdkPrompt replaces Pi's full system prompt with a
- * minimal ~150-char context preamble (environment identity + date + cwd).
+ * When active, buildSdkPrompt replaces Pi's full system prompt with a minimal
+ * ~150-char context preamble (environment identity + date + cwd). This avoids
+ * sending Pi's entire system prompt (with its tool docs) to Cursor on top of
+ * Cursor's own system prompt + tool schemas — duplicated context that inflates
+ * every SDK turn's input tokens.
+ *
+ * DEFAULT: ON. Stripping is the right behavior for the SDK backend (Cursor runs
+ * its own agent with its own prompt), so it's opt-OUT, not opt-in. Set
+ * PI_CURSOR_STRIP_SYSTEM_PROMPT=0 to forward Pi's full system prompt instead.
  */
-const STRIP_SYSTEM_PROMPT = process.env.PI_CURSOR_STRIP_SYSTEM_PROMPT === "1";
+const STRIP_SYSTEM_PROMPT = process.env.PI_CURSOR_STRIP_SYSTEM_PROMPT !== "0";
 
 /**
  * Register the provider against the @cursor/sdk backend (Phase 7).
