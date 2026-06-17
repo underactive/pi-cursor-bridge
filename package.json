@@ -1,12 +1,12 @@
 {
-  "name": "pi-cursor-agent",
+  "name": "pi-cursor-bridge",
   "version": "0.1.0",
   "description": "Pi extension that exposes Cursor's cursor-agent CLI through a local OpenAI-compatible HTTP proxy and registers Cursor models with Pi.",
   "keywords": [
     "pi-extension",
     "pi-package",
     "cursor",
-    "cursor-agent",
+    "cursor-bridge",
     "openai-compatible",
     "proxy"
   ],

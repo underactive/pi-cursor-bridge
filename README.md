@@ -1,6 +1,6 @@
-# pi-cursor-agent
+# pi-cursor-bridge
 
-`pi-cursor-agent` is a Pi extension that registers Cursor models under the `cursor-agent/...` provider namespace. It prefers the **`@cursor/sdk`** backend when installed and authenticated, and falls back to a local **OpenAI-compatible HTTP proxy** that wraps the `cursor-agent` CLI.
+`pi-cursor-bridge` is a Pi extension that registers Cursor models under the `cursor-bridge/...` provider namespace. It prefers the **`@cursor/sdk`** backend when installed and authenticated, and falls back to a local **OpenAI-compatible HTTP proxy** that wraps the `cursor-agent` CLI.
 
 When Pi loads the extension, it also starts (or attaches to) a loopback proxy on `127.0.0.1:32124` for non-Pi OpenAI clients and for CLI fallback mode.
 
@@ -8,14 +8,14 @@ When Pi loads the extension, it also starts (or attaches to) a loopback proxy on
 
 ## Features
 
-- Registers a `Cursor Agent` provider in Pi.
+- Registers a `Cursor Bridge` provider in Pi.
 - **Dual backend:** `@cursor/sdk` (preferred) or CLI/proxy fallback.
 - Exposes `GET /v1/models`, `POST /v1/chat/completions`, and `GET /health` on the local proxy.
 - Also accepts `/models` and `/chat/completions` without the `/v1` prefix.
 - Supports streaming and non-streaming chat completions.
 - Discovers models via SDK catalog or `cursor-agent models --trust`, with disk and in-memory caching.
 - Supports Pi **`reasoning_effort`** / thinking levels via per-model `thinkingLevelMap`.
-- Registers context-window variants in the model picker (e.g. `cursor-agent/gpt-5.5@1m`).
+- Registers context-window variants in the model picker (e.g. `cursor-bridge/gpt-5.5@1m`).
 - Image input on vision-capable models (SDK backend).
 - Multi-turn sessions via `X-Session-Id` header (CLI/proxy path).
 - Pi commands: `/cursor-status`, `/cursor-refresh-models`.
@@ -36,7 +36,7 @@ On the CLI/proxy path, chat completions run `cursor-agent` with `--trust` and `-
 The extension resolves credentials in this order:
 
 1. **`CURSOR_API_KEY`** environment variable
-2. **Pi AuthStorage** — run **`/login`** in Pi and select the `cursor-agent` provider (stored in `~/.pi/agent/auth.json`)
+2. **Pi AuthStorage** — run **`/login`** in Pi and select the `cursor-bridge` provider (stored in `~/.pi/agent/auth.json`)
 3. **`cursor-agent login`** — CLI config at `~/.cursor/cli-config.json`
 
 The **SDK backend requires** a Pi-stored or env API key (`/login` or `CURSOR_API_KEY`). CLI login alone is not enough for SDK mode.
@@ -48,10 +48,10 @@ For CLI spawns and SDK calls, the extension uses the resolved key automatically.
 ### Via npm (recommended)
 
 ```sh
-pi install npm:pi-cursor-agent
+pi install npm:pi-cursor-bridge
 ```
 
-Pi reads the `pi.extensions` field in `package.json` and auto-loads `extensions/cursor-agent.js`. The package includes `@cursor/sdk` as an optional dependency.
+Pi reads the `pi.extensions` field in `package.json` and auto-loads `extensions/cursor-bridge.js`. The package includes `@cursor/sdk` as an optional dependency.
 
 ### Local clone
 
@@ -60,7 +60,7 @@ Clone this repo and either:
 - Symlink the extension into a Pi extension directory:
 
   ```sh
-  ln -s "$PWD/extensions/cursor-agent.js" ~/.pi/agent/extensions/cursor-agent.js
+  ln -s "$PWD/extensions/cursor-bridge.js" ~/.pi/agent/extensions/cursor-bridge.js
   ```
 
 - Or symlink the whole `extensions/` directory contents into a project-local Pi dir (`.pi/extensions/`).
@@ -85,7 +85,7 @@ After reload, open:
 /model
 ```
 
-Select a model like `cursor-agent/auto`, `cursor-agent/composer-2.5`, or another discovered Cursor model.
+Select a model like `cursor-bridge/auto`, `cursor-bridge/composer-2.5`, or another discovered Cursor model.
 
 Check which backend is active:
 
@@ -113,7 +113,7 @@ Set `PI_CURSOR_SDK_DISABLE=1` to force CLI/proxy mode even when `@cursor/sdk` is
 
 Discovery order for the CLI/proxy path:
 
-1. Disk cache at `~/.pi/agent/cursor-agent-model-cache.json` (24-hour TTL by default) — on first call per Pi session
+1. Disk cache at `~/.pi/agent/cursor-bridge-model-cache.json` (24-hour TTL by default) — on first call per Pi session
 2. In-memory cache (60 seconds between CLI refetches within a session)
 3. Live `cursor-agent models --trust` fetch
 4. Stale disk cache (if CLI fetch fails)
@@ -151,7 +151,7 @@ Send a non-streaming chat request:
 ```sh
 curl http://127.0.0.1:32124/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"cursor-agent/auto","messages":[{"role":"user","content":"Say hello"}]}'
+  -d '{"model":"cursor-bridge/auto","messages":[{"role":"user","content":"Say hello"}]}'
 ```
 
 For multi-turn CLI/proxy sessions, pass an `X-Session-Id` header with a stable UUID.
@@ -187,7 +187,7 @@ See [AGENTS.md](AGENTS.md) for repository conventions and contributor notes.
 Validate syntax:
 
 ```sh
-node --check extensions/cursor-agent.js
+node --check extensions/cursor-bridge.js
 ```
 
 Run unit tests:

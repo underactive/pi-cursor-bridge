@@ -1,5 +1,5 @@
 /**
- * pi-cursor-agent Pi Extension
+ * pi-cursor-bridge Pi Extension
  *
  * Starts an OpenAI-compatible HTTP proxy server on port 32124 that wraps
  * Cursor's `cursor-agent` CLI. This lets Pi (and any OpenAI-compatible
@@ -8,7 +8,7 @@
  *
  * Usage:
  *   1. Restart Pi or run /reload
- *   2. Open /model and select a cursor-agent/... model
+ *   2. Open /model and select a cursor-bridge/... model
  *   3. Start chatting!
  *
  * Requires `cursor-agent` to be logged in:
@@ -183,8 +183,8 @@ class SessionManager {
 
 const PORT = 32124;
 const HOST = "127.0.0.1";
-const PROVIDER_ID = "cursor-agent";
-const HEALTH_SERVICE_ID = "cursor-agent";
+const PROVIDER_ID = "cursor-bridge";
+const HEALTH_SERVICE_ID = "cursor-bridge";
 // L3: cap the buffered stdout of a non-streaming cursor-agent reply (16 MiB).
 const MAX_NONSTREAM_STDOUT_BYTES = 16 * 1024 * 1024;
 
@@ -245,7 +245,7 @@ let cachedAuthKey = null;
  * callers use null to mean "no Pi-stored key" (rely on cursor-agent login).
  *
  * The auth.json structure is:
- *   { "cursor-agent": { type: "api_key", key: "ck-..." } }
+ *   { "cursor-bridge": { type: "api_key", key: "ck-..." } }
  *
  * @returns {string|null}
  */
@@ -279,11 +279,11 @@ function getCacheTTL() {
 }
 
 /**
- * Resolve the cache file path: ~/.pi/agent/cursor-agent-model-cache.json
+ * Resolve the cache file path: ~/.pi/agent/cursor-bridge-model-cache.json
  */
 function getCacheFilePath() {
   const home = process.env.HOME || process.env.USERPROFILE || "/tmp";
-  return path.join(home, ".pi", "agent", "cursor-agent-model-cache.json");
+  return path.join(home, ".pi", "agent", "cursor-bridge-model-cache.json");
 }
 
 /**
@@ -445,7 +445,7 @@ async function saveModelCache(models, cliVersion) {
     fs.renameSync(tmpPath, filePath);
   } catch (err) {
     try { fs.unlinkSync(tmpPath); } catch {}
-    console.error("[cursor-agent] Failed to write model cache:", err.message);
+    console.error("[cursor-bridge] Failed to write model cache:", err.message);
   }
 }
 
@@ -561,7 +561,7 @@ function buildPromptFromMessages(messages) {
 
 function normalizeModel(modelId) {
   if (!modelId) return "auto";
-  return modelId.replace(/^cursor-agent\//, "").replace(/@[a-z0-9]+$/, "");
+  return modelId.replace(/^cursor-bridge\//, "").replace(/@[a-z0-9]+$/, "");
 }
 
 // ─── Model Family Detection ─────────────────────────────────────────────
@@ -822,7 +822,7 @@ function formatCursorError(stderr) {
   if (lower.includes("model") && lower.includes("not found")) {
     return "Model not found. Check the model name.";
   }
-  return `cursor-agent error: ${stderr}`;
+  return `cursor-bridge error: ${stderr}`;
 }
 
 // ─── Chat completions handler ─────────────────────────────────────────
@@ -887,7 +887,7 @@ function handleChatCompletions(req, res) {
     // resolved id for cross-turn consistency.
     const effectiveModel = (session && session.modelId) ? session.modelId : cursorModel;
 
-    const id = `cursor-agent-${Date.now()}`;
+    const id = `cursor-bridge-${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
 
     // Always spawn a fresh subprocess per request. cursor-agent reads stdin
@@ -934,7 +934,7 @@ function handleChatCompletions(req, res) {
         if (res.writableFinished) return;
         if (child && !child.killed) {
           child.kill();
-          console.log("[cursor-agent] child killed on client close");
+          console.log("[cursor-bridge] child killed on client close");
         }
       });
 
@@ -1063,7 +1063,7 @@ function handleChatCompletions(req, res) {
 
       child.on("error", (err) => {
         if (!res.writableEnded) {
-          res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: { content: `cursor-agent error: ${err.message}` }, finish_reason: "error" }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: { content: `cursor-bridge error: ${err.message}` }, finish_reason: "error" }] })}\n\n`);
           res.write("data: [DONE]\n\n");
           res.end();
         }
@@ -1078,7 +1078,7 @@ function handleChatCompletions(req, res) {
         if (res.writableFinished) return;
         if (child && !child.killed) {
           child.kill();
-          console.log("[cursor-agent] child killed on client close");
+          console.log("[cursor-bridge] child killed on client close");
         }
       });
 
@@ -1126,7 +1126,7 @@ function handleChatCompletions(req, res) {
           errorText = formatCursorError(stderr.trim());
         }
         if (stdoutTruncated) {
-          console.log(`[cursor-agent] non-streaming stdout truncated at ${MAX_NONSTREAM_STDOUT_BYTES} bytes`);
+          console.log(`[cursor-bridge] non-streaming stdout truncated at ${MAX_NONSTREAM_STDOUT_BYTES} bytes`);
         }
 
         // Report THIS turn's usage. The proxy serves stateless OpenAI clients
@@ -1171,7 +1171,7 @@ function handleChatCompletions(req, res) {
 
       child.on("error", (err) => {
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: `Failed to spawn cursor-agent: ${err.message}`, type: "server_error" } }));
+        res.end(JSON.stringify({ error: { message: `Failed to spawn cursor-agent CLI: ${err.message}`, type: "server_error" } }));
       });
     }
   });
@@ -1211,10 +1211,10 @@ function fetchLocalJson(pathname, timeoutMs = 750) {
 }
 
 /**
- * Probe http://127.0.0.1:32124/health and confirm a pi-cursor-agent proxy
+ * Probe http://127.0.0.1:32124/health and confirm a pi-cursor-bridge proxy
  * is already running there (vs. some unrelated service squatting on
  * the port). Returns true only when the running server identifies
- * itself as cursor-agent.
+ * itself as cursor-bridge.
  */
 async function detectExistingProxy() {
   const health = await fetchLocalJson("/health");
@@ -1288,9 +1288,9 @@ function scheduleStartupLog(pi) {
   startupLogHandlerRegistered = true;
 
   // Pi's default custom-message renderer inserts a blank line between the
-  // [cursor-agent] header and the content. Render it ourselves so the content
+  // [cursor-bridge] header and the content. Render it ourselves so the content
   // appears on the line immediately following the header.
-  pi.registerMessageRenderer("cursor-agent", (message, _options, theme) => {
+  pi.registerMessageRenderer("cursor-bridge", (message, _options, theme) => {
     const label = theme.fg(
       "customMessageLabel",
       `\x1b[1m[${message.customType}]\x1b[22m`,
@@ -1327,24 +1327,24 @@ function scheduleStartupLog(pi) {
     setTimeout(() => {
       if ("error" in payload) {
         if (ctx.hasUI) {
-          pi.sendMessage({ customType: "cursor-agent", content: `Failed to start: ${payload.error}`, display: true });
+          pi.sendMessage({ customType: "cursor-bridge", content: `Failed to start: ${payload.error}`, display: true });
         } else {
-          console.error(`[cursor-agent] Failed to start: ${payload.error}`);
+          console.error(`[cursor-bridge] Failed to start: ${payload.error}`);
         }
         return;
       }
       // Send all startup lines as a single message so consecutive lines render
-      // under one [cursor-agent] header instead of each line getting its own.
+      // under one [cursor-bridge] header instead of each line getting its own.
       if (payload.lines.length === 0) return;
       if (ctx.hasUI) {
         pi.sendMessage({
-          customType: "cursor-agent",
+          customType: "cursor-bridge",
           content: payload.lines.join("\n"),
           display: true,
         });
       } else {
         for (const line of payload.lines) {
-          console.log(`[cursor-agent] ${line}`);
+          console.log(`[cursor-bridge] ${line}`);
         }
       }
     }, 0);
@@ -1811,10 +1811,30 @@ function estimateSdkTokens(text) {
   return Math.max(0, Math.ceil((text || "").length / SDK_APPROX_CHARS_PER_TOKEN));
 }
 
+/**
+ * Build a minimal context preamble that replaces Pi's full system prompt
+ * when PI_CURSOR_STRIP_SYSTEM_PROMPT=1. Keeps only essential context
+ * (environment identity + date + cwd) without Pi's tool definitions
+ * that overlap with Cursor's SDK system prompt.
+ */
+function buildMinimalPreamble() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `You are running inside Pi (a coding agent).\nCurrent date: ${y}-${m}-${d}\nCurrent working directory: ${backendCwd}`;
+}
+
 /** Flatten Pi's Context into a single prompt string for one SDK agent send. */
 function buildSdkPrompt(context) {
   const parts = [];
-  if (context.systemPrompt) parts.push(context.systemPrompt);
+  if (context.systemPrompt) {
+    if (STRIP_SYSTEM_PROMPT) {
+      parts.push(buildMinimalPreamble());
+    } else {
+      parts.push(context.systemPrompt);
+    }
+  }
   for (const msg of context.messages || []) {
     if (msg.role === "user") {
       parts.push(`User: ${extractSdkText(msg.content)}`);
@@ -1860,11 +1880,11 @@ function extractSdkText(content) {
 /** @type {Map<string, object>} sessionKey → live run state */
 // A module-scoped handle to the Pi runtime, captured at extension load so code
 // far from the default export (e.g. the bridge's abort handler) can surface a
-// user-facing notification. Rendered as a boxed [cursor-agent] message by the
+// user-facing notification. Rendered as a boxed [cursor-bridge] message by the
 // renderer registered in scheduleStartupLog; no-ops safely in headless runs.
 let activePi = null;
 function notifyCursor(content) {
-  try { activePi && activePi.sendMessage({ customType: "cursor-agent", content, display: true }); } catch {}
+  try { activePi && activePi.sendMessage({ customType: "cursor-bridge", content, display: true }); } catch {}
 }
 
 const cursorLiveRuns = new Map();
@@ -1994,7 +2014,7 @@ function armBridgeIdle(liveRun) {
   if (liveRun.settled) return;
   liveRun.idleTimer = setTimeout(() => {
     if (liveRun.settled) return;
-    console.log("[cursor-agent] bridge run idle-timeout — finalizing stale live run");
+    console.log("[cursor-bridge] bridge run idle-timeout — finalizing stale live run");
     finalizeBridge(liveRun, liveRun.sessionKey, null, makeSdkAbort(), liveRun.apiKey);
   }, BRIDGE_IDLE_TTL_MS);
   if (liveRun.idleTimer.unref) liveRun.idleTimer.unref();
@@ -2267,7 +2287,7 @@ function isSdkAbort(error) {
 
 function registerCursorProvider(pi, modelConfigs) {
   pi.registerProvider(PROVIDER_ID, {
-    name: "Cursor Agent",
+    name: "Cursor Bridge",
     baseUrl: `http://${HOST}:${PORT}/v1`,
     apiKey: "$PI_CURSOR_AGENT_API_KEY",
     api: "openai-completions",
@@ -2289,6 +2309,17 @@ function registerCursorProvider(pi, modelConfigs) {
 const DISABLE_SDK_BACKEND = process.env.PI_CURSOR_SDK_DISABLE === "1";
 
 /**
+ * Set to "1" to strip Pi's system prompt from the SDK agent prompt, relying
+ * on Cursor's SDK system prompt for agent behavior instructions instead.
+ * Pi tool bridging (the bridgeSteeringPreamble) is unaffected and still
+ * tells the model which Pi tools to use.
+ *
+ * When active, buildSdkPrompt replaces Pi's full system prompt with a
+ * minimal ~150-char context preamble (environment identity + date + cwd).
+ */
+const STRIP_SYSTEM_PROMPT = process.env.PI_CURSOR_STRIP_SYSTEM_PROMPT === "1";
+
+/**
  * Register the provider against the @cursor/sdk backend (Phase 7).
  *
  * Unlike the proxy provider, this routes Pi turns through `streamCursorSdk`
@@ -2299,7 +2330,7 @@ const DISABLE_SDK_BACKEND = process.env.PI_CURSOR_SDK_DISABLE === "1";
  */
 function registerCursorSdkProvider(pi, modelConfigs) {
   pi.registerProvider(PROVIDER_ID, {
-    name: "Cursor Agent",
+    name: "Cursor Bridge",
     baseUrl: `http://${HOST}:${PORT}/v1`, // inert: SDK path bypasses HTTP
     apiKey: "$PI_CURSOR_AGENT_API_KEY",
     api: CURSOR_SDK_API,
@@ -2358,7 +2389,7 @@ function getSdkVersion() {
 /** Render the current status as display lines (used by command + startup log). */
 function getCursorStatusLines() {
   const authSource = cachedAuthKey
-    ? "Pi AuthStorage (cursor-agent)"
+    ? "Pi AuthStorage (cursor-bridge)"
     : (process.env.CURSOR_API_KEY ? "CURSOR_API_KEY env" : "none");
   const sdkVersion = getSdkVersion();
   const rg = process.env.CURSOR_RIPGREP_PATH;
@@ -2378,7 +2409,7 @@ function getCursorStatusLines() {
 /** Compact backend summary for the one-time startup log. */
 function buildStartupLogLines() {
   const authSource = cachedAuthKey
-    ? "Pi AuthStorage (cursor-agent)"
+    ? "Pi AuthStorage (cursor-bridge)"
     : (process.env.CURSOR_API_KEY ? "CURSOR_API_KEY env" : "none");
   const sdkVersion = getSdkVersion();
   const lines = [
@@ -2436,8 +2467,8 @@ export default async function (pi) {
   // handler these can crash the host or print scary stacks. Swallow ONLY
   // SDK-originated rejections; re-surface anything else so real bugs aren't
   // hidden. Registered once (reload-safe) to avoid accumulating handlers.
-  if (!globalThis.__piCursorSdkRejectionGuard) {
-    globalThis.__piCursorSdkRejectionGuard = true;
+  if (!globalThis.__piCursorBridgeSdkRejectionGuard) {
+    globalThis.__piCursorBridgeSdkRejectionGuard = true;
     // PROCESS-GLOBAL side effect: this listener suppresses Node's default
     // crash-on-unhandled-rejection for the WHOLE Pi process. We keep it
     // deliberately — crashing all of Pi over one stray cross-turn SDK leak is
@@ -2446,7 +2477,7 @@ export default async function (pi) {
     // real application bugs stay visible rather than being silently dropped. (M5)
     process.on("unhandledRejection", (reason) => {
       if (isSdkRejection(reason)) return; // benign cross-turn SDK leak
-      console.error("[cursor-agent] unhandled rejection:", reason);
+      console.error("[cursor-bridge] unhandled rejection:", reason);
     });
   }
   scheduleStartupLog(pi);
@@ -2461,10 +2492,10 @@ export default async function (pi) {
 
   // Close any server from a previous load so /reload re-binds the port with
   // the latest handler code instead of silently reusing the stale server.
-  const PREV = globalThis.__piCursorAgentServer;
+  const PREV = globalThis.__piCursorBridgeServer;
   if (PREV) {
     try { PREV.close(); } catch {}
-    globalThis.__piCursorAgentServer = null;
+    globalThis.__piCursorBridgeServer = null;
   }
 
   let modelsCache = [];
@@ -2524,29 +2555,29 @@ export default async function (pi) {
         if (count === 0) {
           const warn = `No models discovered via ${via} — check auth (/login) and connectivity, then retry.`;
           if (ctx.hasUI) {
-            pi.sendMessage({ customType: "cursor-agent", content: warn, display: true });
+            pi.sendMessage({ customType: "cursor-bridge", content: warn, display: true });
           } else {
-            console.warn(`[cursor-agent] ${warn}`);
+            console.warn(`[cursor-bridge] ${warn}`);
           }
         } else if (ctx.hasUI) {
           pi.sendMessage({
-            customType: "cursor-agent",
+            customType: "cursor-bridge",
             content: `Refreshed ${count} models via ${via}`,
             display: true,
           });
         } else {
-          console.log(`[cursor-agent] Refreshed ${count} models via ${via}`);
+          console.log(`[cursor-bridge] Refreshed ${count} models via ${via}`);
         }
       } catch (err) {
         const msg = `Failed to refresh models: ${err.message}`;
         if (ctx.hasUI) {
           pi.sendMessage({
-            customType: "cursor-agent",
+            customType: "cursor-bridge",
             content: msg,
             display: true,
           });
         } else {
-          console.error(`[cursor-agent] ${msg}`);
+          console.error(`[cursor-bridge] ${msg}`);
         }
       }
     },
@@ -2558,11 +2589,11 @@ export default async function (pi) {
   pi.registerCommand("cursor-status", {
     description: "Show Cursor backend status (SDK vs CLI, models, auth, proxy)",
     handler: async (_args, ctx) => {
-      const content = `Cursor Agent — status\n${getCursorStatusLines().map((l) => `  ${l}`).join("\n")}`;
+      const content = `Cursor Bridge — status\n${getCursorStatusLines().map((l) => `  ${l}`).join("\n")}`;
       if (ctx.hasUI) {
-        pi.sendMessage({ customType: "cursor-agent", content, display: true });
+        pi.sendMessage({ customType: "cursor-bridge", content, display: true });
       } else {
-        console.log(`[cursor-agent]\n${content}`);
+        console.log(`[cursor-bridge]\n${content}`);
       }
     },
   });
@@ -2603,7 +2634,7 @@ export default async function (pi) {
         saveModelCache(modelsCache).catch(() => {});
       }
     } catch (err) {
-      console.error("[cursor-agent] Failed to fetch models:", err.message);
+      console.error("[cursor-bridge] Failed to fetch models:", err.message);
       if (modelsCache.length === 0) {
         // Try stale disk cache before falling back to FALLBACK_MODELS
         if (!DISABLE_MODEL_CACHE) {
@@ -2640,7 +2671,7 @@ export default async function (pi) {
   /**
    * Register against an already-running sibling proxy without binding
    * the port ourselves. Lets multiple Pi instances share one proxy
-   * so the second/third instance still gets cursor-agent models in
+   * so the second/third instance still gets cursor-bridge models in
    * /model instead of failing with EADDRINUSE.
    */
   async function attachToExistingProxy(reason) {
@@ -2697,7 +2728,7 @@ export default async function (pi) {
     await new Promise((resolve, reject) => {
       const onListening = () => {
         server.removeListener("error", onError);
-        globalThis.__piCursorAgentServer = server;
+        globalThis.__piCursorBridgeServer = server;
         resolve();
       };
       const onError = (err) => {
@@ -2732,7 +2763,7 @@ export default async function (pi) {
   } catch (err) {
     // Race: another Pi instance bound the port between our probe and
     // our listen(). Fall back to client-only mode so the user still
-    // gets cursor-agent models instead of a hard failure.
+    // gets cursor-bridge models instead of a hard failure.
     if (err && err.code === "EADDRINUSE" && (await detectExistingProxy())) {
       await attachToExistingProxy("port became busy during startup");
       return;
