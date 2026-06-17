@@ -111,7 +111,7 @@
 1. New `extensions/cursor-session.js` module with `CursorSession`, `SessionManager`, `buildSessionPrompt` exports.
 2. `activeSessionManager` initialized in `startProxyServer()`.
 3. Session routing in `handleChatCompletions`: `X-Session-Id` header → `getOrCreateSession()`.
-4. Session-aware prompt construction: first turn sends full history, subsequent turns send only unseen messages.
+4. ~~Session-aware prompt construction: first turn sends full history, subsequent turns send only unseen messages.~~ **Correction (improvement-refactor.md):** not implemented and not needed — `handleChatCompletions` always rebuilds the prompt from the full request body via `buildPromptFromMessages` (the correct OpenAI convention, since clients send full history every turn). The `buildSessionPrompt` helper this implied is dead code; see refactor item H3.
 5. Token usage accumulated across turns via `session.accumulateUsage()`.
 6. `/cursor-refresh-models` command registered early — available on all startup paths.
 7. Cache format version bumped to 2 to persist `contextWindow`/`maxTokens` fields.

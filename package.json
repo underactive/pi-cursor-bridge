@@ -13,8 +13,12 @@
   "license": "MIT",
   "author": "Eric Sison <eric@underactive.net>",
   "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
   "files": [
     "extensions/",
+    "lib/",
     "README.md",
     "AGENTS.md",
     "LICENSE"

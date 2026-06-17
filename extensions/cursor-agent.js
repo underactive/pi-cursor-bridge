@@ -21,10 +21,28 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-// ─── Session Management (inlined from cursor-session.js) ────────────
+
+// Pure, dependency-free helpers (unit-tested via `node --test`). They live in
+// ../lib/cursor-helpers.js — OUTSIDE ./extensions so Pi doesn't auto-discover the
+// file as its own extension. Pi loads this extension through a symlink and
+// resolves relative specifiers against the symlink directory (not the repo), so
+// a STATIC `import "../lib/..."` fails at load. loadSdkHelpers() instead follows
+// this file's realpath back to the repo and dynamic-imports the module. The
+// bindings are populated by loadSdkHelpers() before any request is served.
+let collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError;
+
+async function loadSdkHelpers() {
+  const selfReal = fs.realpathSync(fileURLToPath(import.meta.url));
+  const helpersPath = path.join(path.dirname(selfReal), "..", "lib", "cursor-helpers.js");
+  const helpers = await import(pathToFileURL(helpersPath).href);
+  ({ collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError } = helpers);
+}
+
+// ─── Session Management ──────────────────────────────────────────────────────
 
 /**
  * Default session idle timeout (5 minutes in ms).
@@ -43,7 +61,10 @@ function getSessionTimeout() {
 }
 
 /**
- * Represents a single multi-turn conversation session with cursor-agent.
+ * Tracks one cursor-agent session: the pinned model id and the live subprocess
+ * for an `X-Session-Id` conversation, plus idle-timeout bookkeeping. Prompt
+ * text is always rebuilt from the request body (OpenAI convention), so no
+ * message history or cumulative usage is retained here.
  */
 class CursorSession {
   /**
@@ -53,34 +74,12 @@ class CursorSession {
   constructor(sessionId, modelId) {
     this.sessionId = sessionId;
     this.modelId = modelId;
-    this.messageHistory = [];
-    this.tokenUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
     this.subprocessRef = null;
     this.createdAt = Date.now();
     this.lastActivityAt = Date.now();
   }
 
   touch() { this.lastActivityAt = Date.now(); }
-
-  addMessages(messages) {
-    const msgs = Array.isArray(messages) ? messages : [messages];
-    this.messageHistory.push(...msgs);
-    this.touch();
-  }
-
-  resetHistory() {
-    this.messageHistory = [];
-    this.tokenUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
-    this.touch();
-  }
-
-  accumulateUsage(usage) {
-    if (!usage) return;
-    this.tokenUsage.inputTokens += usage.inputTokens ?? 0;
-    this.tokenUsage.outputTokens += usage.outputTokens ?? 0;
-    this.tokenUsage.cacheReadTokens += usage.cacheReadTokens ?? 0;
-    this.tokenUsage.cacheWriteTokens += usage.cacheWriteTokens ?? 0;
-  }
 
   isExpired(timeoutMs) {
     const ttl = timeoutMs ?? getSessionTimeout();
@@ -180,48 +179,14 @@ class SessionManager {
   }
 }
 
-/**
- * Build a text prompt from a session's message history that cursor-agent
- * can understand.
- */
-function buildSessionPrompt(session) {
-  const parts = [];
-
-  for (const msg of session.messageHistory) {
-    const role = msg.role || "user";
-    let content = "";
-
-    if (typeof msg.content === "string") {
-      content = msg.content;
-    } else if (Array.isArray(msg.content)) {
-      content = msg.content
-        .filter((c) => c.type === "text")
-        .map((c) => c.text)
-        .join("\n");
-    }
-
-    if (role === "system") {
-      parts.push(`<|im_start|>system\n${content}\n<|im_end|>`);
-    } else if (role === "user") {
-      parts.push(`<|im_start|>user\n${content}\n<|im_end|>`);
-    } else if (role === "assistant") {
-      parts.push(`<|im_start|>assistant\n${content}\n<|im_end|>`);
-    } else if (role === "tool") {
-      const toolName = msg.name ? ` (${msg.name})` : "";
-      const toolCallId = msg.tool_call_id ? ` [call:${msg.tool_call_id}]` : "";
-      parts.push(`<|im_start|>tool${toolName}${toolCallId}\n${content}\n<|im_end|>`);
-    }
-  }
-
-  return parts.join("\n");
-}
-
 // ─── Config ───────────────────────────────────────────────────────────
 
 const PORT = 32124;
 const HOST = "127.0.0.1";
 const PROVIDER_ID = "cursor-agent";
 const HEALTH_SERVICE_ID = "cursor-agent";
+// L3: cap the buffered stdout of a non-streaming cursor-agent reply (16 MiB).
+const MAX_NONSTREAM_STDOUT_BYTES = 16 * 1024 * 1024;
 
 /**
  * Resolve the cursor-agent binary path.
@@ -333,6 +298,13 @@ function getCacheFilePath() {
  * @returns {string} hex-encoded SHA-256 hash
  */
 function getAuthHash() {
+  // L4 — auth-source layering (intentional precedence):
+  //   1. CURSOR_API_KEY env — an explicit override always wins.
+  //   2. Pi-stored key from /login (`pikey:`) — the Pi-native default (Phase 5).
+  //   3. ~/.cursor/cli-config.json — the cursor-agent CLI's own login.
+  //   4. "unauthenticated" sentinel.
+  // This hash only keys the on-disk model cache, so env-first is safe: a user
+  // who sets the env var is deliberately choosing that identity for caching.
   const apiKey = process.env.CURSOR_API_KEY;
   if (apiKey) {
     return crypto.createHash("sha256").update(`apikey:${apiKey}`).digest("hex");
@@ -893,8 +865,12 @@ function handleChatCompletions(req, res) {
     // not family base names (e.g. "gpt-5.5"). resolveModelVariant handles
     // both with and without reasoning_effort — when absent, it returns
     // the default variant.
-    if (typeof __variantMap !== "undefined") {
-      const resolved = resolveModelVariant(cursorModel, reasoning_effort, __variantMap);
+    // L5: snapshot the variant map once. /cursor-refresh-models reassigns the
+    // global mid-flight; capturing a stable reference here keeps this request
+    // reading one consistent map instead of a half-cleared one.
+    const variantMap = (typeof __variantMap !== "undefined") ? __variantMap : null;
+    if (variantMap) {
+      const resolved = resolveModelVariant(cursorModel, reasoning_effort, variantMap);
       if (resolved) {
         cursorModel = resolved;
       }
@@ -906,13 +882,9 @@ function handleChatCompletions(req, res) {
       ? activeSessionManager.getOrCreateSession(sessionId, cursorModel)
       : null;
 
-    // Persist resolved model ID if this is a new session
-    if (session && sessionId && !session.messageHistory.length) {
-      // First turn — persist model ID for cross-turn consistency
-      session.modelId = cursorModel;
-    }
-
-    // Use persisted model ID for subsequent turns
+    // Model is pinned at session creation (getOrCreateSession sets modelId and
+    // never overwrites it on reuse), so subsequent turns reuse the first turn's
+    // resolved id for cross-turn consistency.
     const effectiveModel = (session && session.modelId) ? session.modelId : cursorModel;
 
     const id = `cursor-agent-${Date.now()}`;
@@ -955,6 +927,17 @@ function handleChatCompletions(req, res) {
         Connection: "keep-alive",
       });
 
+      // M2: if the client drops the connection mid-stream, kill the subprocess
+      // instead of leaking it until the idle timer. writableFinished distinguishes
+      // the normal-completion close (res.end already ran) from a real disconnect.
+      res.on("close", () => {
+        if (res.writableFinished) return;
+        if (child && !child.killed) {
+          child.kill();
+          console.log("[cursor-agent] child killed on client close");
+        }
+      });
+
       // With --stream-partial-output, assistant events are usually incremental
       // deltas; the stream may end with one cumulative snapshot. Track assembled
       // text so we only forward the new suffix and skip duplicate finals.
@@ -963,7 +946,7 @@ function handleChatCompletions(req, res) {
       child.stderr.on("data", () => { /* errors surfaced via [DONE] for now */ });
 
       const writeChunk = (content) => {
-        if (!content) return;
+        if (!content || res.writableEnded) return; // M2: guard post-close EPIPE
         res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n`);
       };
 
@@ -1014,18 +997,10 @@ function handleChatCompletions(req, res) {
             }],
           };
           res.write(`data: ${JSON.stringify(toolCallPayload)}\n\n`);
-          // Record tool call in session history if available
-          if (session && event.message) {
-            session.messageHistory.push(event.message);
-          }
           return;
         }
 
         if (event.type === "assistant" && event.message?.content) {
-          // Record assistant message in session history
-          if (session && event.message) {
-            session.messageHistory.push(event.message);
-          }
           for (const block of event.message.content) {
             if (block.type !== "text" || !block.text) continue;
             forwardAssistantText(block.text);
@@ -1067,18 +1042,18 @@ function handleChatCompletions(req, res) {
           } catch {}
         }
 
-        // Accumulate usage into session
-        if (session && usage) {
-          session.accumulateUsage(usage);
+        // Report THIS turn's usage. The proxy serves stateless OpenAI clients
+        // that sum per-response usage, so a cumulative total would over-count.
+        const finalUsage = usage || {};
+        // M2: the client may have disconnected — only write if the response is open.
+        if (!res.writableEnded) {
+          if (finalUsage.inputTokens !== undefined || finalUsage.outputTokens !== undefined) {
+            res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [], usage: { prompt_tokens: finalUsage.inputTokens ?? 0, completion_tokens: finalUsage.outputTokens ?? 0, total_tokens: (finalUsage.inputTokens ?? 0) + (finalUsage.outputTokens ?? 0), cache_read_tokens: finalUsage.cacheReadTokens ?? 0, cache_write_tokens: finalUsage.cacheWriteTokens ?? 0 } })}\n\n`);
+          }
+          res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
         }
-
-        const finalUsage = session ? session.tokenUsage : (usage || {});
-        if (finalUsage.inputTokens !== undefined || finalUsage.outputTokens !== undefined) {
-          res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [], usage: { prompt_tokens: finalUsage.inputTokens ?? 0, completion_tokens: finalUsage.outputTokens ?? 0, total_tokens: (finalUsage.inputTokens ?? 0) + (finalUsage.outputTokens ?? 0), cache_read_tokens: finalUsage.cacheReadTokens ?? 0, cache_write_tokens: finalUsage.cacheWriteTokens ?? 0 } })}\n\n`);
-        }
-        res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
-        res.write("data: [DONE]\n\n");
-        res.end();
 
         // Start idle timeout for session release
         if (session && sessionId) {
@@ -1096,9 +1071,26 @@ function handleChatCompletions(req, res) {
 
     } else {
       // ── Non-streaming ──
+      // M2: the whole reply is buffered until child close, so an early client
+      // drop would otherwise leak the subprocess — kill it on disconnect.
+      // writableFinished excludes the normal-completion close.
+      res.on("close", () => {
+        if (res.writableFinished) return;
+        if (child && !child.killed) {
+          child.kill();
+          console.log("[cursor-agent] child killed on client close");
+        }
+      });
+
       let stdout = "";
       let stderr = "";
-      child.stdout.on("data", (d) => (stdout += d.toString()));
+      let stdoutTruncated = false;
+      // L3: bound the buffered stdout. Model output is small in practice, but an
+      // unbounded `+=` would let a pathological response grow memory without limit.
+      child.stdout.on("data", (d) => {
+        if (stdout.length >= MAX_NONSTREAM_STDOUT_BYTES) { stdoutTruncated = true; return; }
+        stdout += d.toString();
+      });
       child.stderr.on("data", (d) => (stderr += d.toString()));
 
       child.on("close", (code) => {
@@ -1117,18 +1109,8 @@ function handleChatCompletions(req, res) {
               thinkingText += (event.content || event.text || "");
             }
             if (event.type === "assistant" && event.message?.content) {
-              // Record assistant message in session history
-              if (session && event.message) {
-                session.messageHistory.push(event.message);
-              }
               for (const block of event.message.content) {
                 if (block.type === "text") assistantText = block.text;
-              }
-            }
-            if (event.type === "tool_call") {
-              // Record tool call in session history for follow-up
-              if (session && event.message) {
-                session.messageHistory.push(event.message);
               }
             }
             if (event.type === "result") {
@@ -1143,13 +1125,13 @@ function handleChatCompletions(req, res) {
         if ((code !== 0 || !assistantText) && stderr.trim()) {
           errorText = formatCursorError(stderr.trim());
         }
-
-        // Accumulate usage into session
-        if (session && usage) {
-          session.accumulateUsage(usage);
+        if (stdoutTruncated) {
+          console.log(`[cursor-agent] non-streaming stdout truncated at ${MAX_NONSTREAM_STDOUT_BYTES} bytes`);
         }
 
-        const finalUsage = session ? session.tokenUsage : (usage || {});
+        // Report THIS turn's usage. The proxy serves stateless OpenAI clients
+        // that sum per-response usage, so a cumulative total would over-count.
+        const finalUsage = usage || {};
 
         const responseMessage = {
           role: "assistant",
@@ -1159,7 +1141,6 @@ function handleChatCompletions(req, res) {
           responseMessage.reasoning_text = thinkingText;
         }
 
-        res.writeHead(200, { "Content-Type": "application/json" });
         const responsePayload = {
           id,
           object: "chat.completion",
@@ -1176,7 +1157,11 @@ function handleChatCompletions(req, res) {
             cache_write_tokens: finalUsage.cacheWriteTokens ?? 0,
           };
         }
-        res.end(JSON.stringify(responsePayload));
+        // M2: skip the response write if the client already disconnected.
+        if (!res.writableEnded) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(responsePayload));
+        }
 
         // Start idle timeout for session release
         if (session && sessionId) {
@@ -1268,7 +1253,8 @@ function startProxyServer(modelsFn) {
 
       if (url.pathname === "/health" && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, service: HEALTH_SERVICE_ID }));
+        // liveRuns drives the H1/H2 diagnostics: poll until it returns to 0.
+        res.end(JSON.stringify({ ok: true, service: HEALTH_SERVICE_ID, liveRuns: cursorLiveRuns.size }));
         return;
       }
 
@@ -1390,14 +1376,7 @@ function buildModelConfigs(models) {
     const vKeys = Object.keys(familyEntry.variants);
     const tvKeys = Object.keys(familyEntry.thinkingVariants);
 
-    const map = {
-      off: null,
-      minimal: null,
-      low: null,
-      medium: null,
-      high: null,
-      xhigh: null,
-    };
+    const map = emptyThinkingLevelMap(); // L6: shared base shape
 
     // Map non-thinking variants: Pi level → effort token
     if (vKeys.includes("low")) map.low = "low";
@@ -1514,8 +1493,10 @@ function buildModelConfigs(models) {
 // a ModelSelection.params entry, never the ID, and a missing tier is simply omitted.
 //
 // Inlined (not a separate module) because Pi loads each extension as a single
-// symlinked file via jiti — a sibling file wouldn't resolve. Matches how
-// cursor-session.js was inlined.
+// symlinked file via jiti, and it auto-discovers every sibling .js under
+// ./extensions as its own extension — so provider code stays in this one file.
+// (Pure, framework-free helpers live in ../lib/cursor-helpers.js, which sits
+// outside ./extensions precisely to avoid that auto-discovery.)
 //
 // RUNTIME: @cursor/sdk uses connect-rpc + a native binary. Transient transport
 // errors (rare) surface as NetworkError; discovery failures fall back to the CLI
@@ -1609,6 +1590,15 @@ function sdkContextValueToTokens(value) {
 }
 
 /**
+ * The empty Pi thinking-level map: all six levels unsupported (null). Shared
+ * base for buildThinkingLevelMap (CLI families) and buildSdkThinkingLevelMap
+ * (SDK params) so the Pi level set can't drift between the two. (L6)
+ */
+function emptyThinkingLevelMap() {
+  return { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null };
+}
+
+/**
  * Build a Pi thinkingLevelMap from a model's parameter set. Values are the
  * concrete param value per Pi level; null marks a level unsupported. Returns
  * null when the model exposes no reasoning controls. Precedence effort > reasoning.
@@ -1625,14 +1615,14 @@ function buildSdkThinkingLevelMap(paramById) {
   const thinking = paramById.thinking;
   if (effort) {
     const low = pick(effort, ["low", "minimal"]);
-    return { off: null, minimal: low, low, medium: pick(effort, ["medium"]), high: pick(effort, ["high"]), xhigh: pick(effort, ["max", "extra-high", "xhigh", "high"]) };
+    return { ...emptyThinkingLevelMap(), minimal: low, low, medium: pick(effort, ["medium"]), high: pick(effort, ["high"]), xhigh: pick(effort, ["max", "extra-high", "xhigh", "high"]) };
   }
   if (reasoning) {
     const low = pick(reasoning, ["low", "minimal"]);
-    return { off: null, minimal: low, low, medium: pick(reasoning, ["medium"]), high: pick(reasoning, ["high"]), xhigh: pick(reasoning, ["high", "medium"]) };
+    return { ...emptyThinkingLevelMap(), minimal: low, low, medium: pick(reasoning, ["medium"]), high: pick(reasoning, ["high"]), xhigh: pick(reasoning, ["high", "medium"]) };
   }
   if (thinking) {
-    return { off: null, minimal: "true", low: "true", medium: "true", high: "true", xhigh: "true" };
+    return { ...emptyThinkingLevelMap(), minimal: "true", low: "true", medium: "true", high: "true", xhigh: "true" };
   }
   return null;
 }
@@ -1817,13 +1807,6 @@ class SdkPartialEmitter {
   }
 }
 
-/** A resolvable/rejectable promise (for cross-turn tool bridging). */
-function sdkDeferred() {
-  let resolve, reject;
-  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
-  return { promise, resolve, reject };
-}
-
 function estimateSdkTokens(text) {
   return Math.max(0, Math.ceil((text || "").length / SDK_APPROX_CHARS_PER_TOKEN));
 }
@@ -1856,44 +1839,6 @@ function extractSdkText(content) {
   }).filter(Boolean).join("");
 }
 
-/**
- * Collect Pi ImageContent parts from user turns into SDK SDKImage[] — base64
- * passthrough (Pi's { data, mimeType } maps 1:1 onto the SDK's image shape).
- * Scans the whole history: the SDK backend uses a fresh agent per turn, so
- * earlier images must be re-sent for multi-turn image conversations to work.
- * User turns only — tool-produced images are a separate concern (backlog).
- */
-function collectSdkImages(context) {
-  const images = [];
-  for (const msg of (context && context.messages) || []) {
-    if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
-    for (const part of msg.content) {
-      if (part && part.type === "image" && typeof part.data === "string" && part.data) {
-        images.push({ data: part.data, mimeType: part.mimeType || "image/png" });
-      }
-    }
-  }
-  return images;
-}
-
-/** Map an SDK/transport error to a short, key-scrubbed, user-facing message. */
-function sanitizeSdkError(error, apiKey) {
-  let message = error && error.message ? String(error.message) : String(error);
-  if (apiKey && message.includes(apiKey)) message = message.split(apiKey).join("***");
-  const lower = message.toLowerCase();
-  const name = (error && error.constructor && error.constructor.name) || "";
-  if (/auth|401|unauthor|api key|apikey/.test(lower) || name === "AuthenticationError") {
-    return "Authentication failed. Set a Cursor API key via /login or CURSOR_API_KEY.";
-  }
-  if (/network|fetch failed|econn|timeout|socket/.test(lower) || name === "NetworkError") {
-    return "Network error reaching Cursor — check connectivity and try again.";
-  }
-  if (/quota|rate|429/.test(lower) || name === "RateLimitError") {
-    return "Rate limited or quota exceeded. Check your Cursor subscription.";
-  }
-  return `Cursor SDK error: ${message}`;
-}
-
 // ─── Pi → Cursor tool bridge (cross-turn live run) ───────────────────────────
 //
 // Pi's tool protocol is cross-turn: the provider emits toolCall blocks + a
@@ -1913,7 +1858,21 @@ function sanitizeSdkError(error, apiKey) {
 // tool-set per session.
 
 /** @type {Map<string, object>} sessionKey → live run state */
+// A module-scoped handle to the Pi runtime, captured at extension load so code
+// far from the default export (e.g. the bridge's abort handler) can surface a
+// user-facing notification. Rendered as a boxed [cursor-agent] message by the
+// renderer registered in scheduleStartupLog; no-ops safely in headless runs.
+let activePi = null;
+function notifyCursor(content) {
+  try { activePi && activePi.sendMessage({ customType: "cursor-agent", content, display: true }); } catch {}
+}
+
 const cursorLiveRuns = new Map();
+
+// Idle TTL for a parked live run awaiting Pi's tool results. Mirrors the 5-min
+// session timeout so an abandoned bridged turn can't leak its agent, and a
+// stale run can't linger under the shared default key. (H1)
+const BRIDGE_IDLE_TTL_MS = DEFAULT_SESSION_TIMEOUT_MS;
 
 function bridgeSessionKey(options) {
   return (options && options.sessionId) || "__cursor_sdk_default__";
@@ -1972,7 +1931,7 @@ function buildBridgeCustomTools(liveRun, tools) {
  */
 function bridgeExecute(liveRun, piToolName, args, ctx) {
   const toolCallId = (ctx && ctx.toolCallId) || `bridge-${liveRun.callSeq++}`;
-  const d = sdkDeferred();
+  const d = makeSdkDeferred();
   liveRun.pendingTools.set(toolCallId, { d, piToolName, args, surfaced: false });
   scheduleSurface(liveRun);
   return d.promise;
@@ -2022,38 +1981,85 @@ function handleBridgeDelta(liveRun, update) {
   }
 }
 
+/** Clear a parked run's idle-eviction timer. (H1) */
+function clearBridgeIdle(liveRun) {
+  if (liveRun.idleTimer) { clearTimeout(liveRun.idleTimer); liveRun.idleTimer = null; }
+}
+
+/** Arm the idle-eviction timer for a run parked awaiting Pi's tool results. If
+ *  Pi never resumes, finalize the run so its agent + pending Promise are freed
+ *  (and it can't be mis-resumed later). unref() so it never holds Pi open. (H1) */
+function armBridgeIdle(liveRun) {
+  clearBridgeIdle(liveRun);
+  if (liveRun.settled) return;
+  liveRun.idleTimer = setTimeout(() => {
+    if (liveRun.settled) return;
+    console.log("[cursor-agent] bridge run idle-timeout — finalizing stale live run");
+    finalizeBridge(liveRun, liveRun.sessionKey, null, makeSdkAbort(), liveRun.apiKey);
+  }, BRIDGE_IDLE_TTL_MS);
+  if (liveRun.idleTimer.unref) liveRun.idleTimer.unref();
+}
+
+/** True if any trailing toolResult id matches a tool still pending on this run.
+ *  Guards the resume branch so a stale run under the shared default session key
+ *  is NOT resumed into an unrelated new conversation. (H1) */
+function resumeMatches(liveRun, context) {
+  for (const tr of getTrailingToolResults(context)) {
+    if (tr.toolCallId && liveRun.pendingTools.has(tr.toolCallId)) return true;
+  }
+  return false;
+}
+
+/** (Re)bind the abort handler to the CURRENT turn's AbortSignal. Pi delivers a
+ *  fresh signal each turn, so without rebinding, an abort after turn 1 is
+ *  silently ignored and the run is leaked + uncancellable. (H2) */
+function bindBridgeAbort(liveRun, signal) {
+  if (liveRun.abortSignal && liveRun.onAbort) {
+    try { liveRun.abortSignal.removeEventListener("abort", liveRun.onAbort); } catch {}
+  }
+  liveRun.abortSignal = signal || null;
+  if (!signal) return;
+  if (signal.aborted) { liveRun.onAbort(); return; }
+  signal.addEventListener("abort", liveRun.onAbort, { once: true });
+}
+
 /** Finalize the whole live run (agent.send settled) onto the current stream. */
 function finalizeBridge(liveRun, sessionKey, result, error, apiKey) {
   if (liveRun.settled) return;
   liveRun.settled = true;
+  clearBridgeIdle(liveRun);
   cursorLiveRuns.delete(sessionKey);
   for (const [, p] of liveRun.pendingTools) { try { p.d.reject(makeSdkAbort()); } catch {} }
   liveRun.pendingTools.clear();
   if (liveRun.agent) { try { liveRun.agent.close(); } catch { /* best effort */ } }
 
   const { stream, emitter, partial } = liveRun;
-  if (liveRun.aborted || (result && result.status === "cancelled")) {
-    finalizeSdkAbort(stream, emitter, partial);
-  } else if (error || (result && result.status === "error")) {
-    emitter.closeThinking();
-    emitter.closeText();
-    partial.stopReason = "error";
-    partial.errorMessage = sanitizeSdkError(error || new Error((result && result.error) || "Cursor SDK run failed"), apiKey);
-    stream.push({ type: "error", reason: "error", error: partial });
-  } else {
-    const streamed = emitter.currentText();
-    const finalText = (result && result.result) || "";
-    if (finalText && finalText.length > streamed.length && finalText.startsWith(streamed)) {
-      emitter.appendText(finalText.slice(streamed.length));
-    } else if (finalText && !streamed) {
-      emitter.appendText(finalText);
+  // Wrapped: an idle/stale finalize targets a stream Pi already consumed and
+  // ended, so emitting onto it is a harmless no-op rather than a throw.
+  try {
+    if (liveRun.aborted || (result && result.status === "cancelled")) {
+      finalizeSdkAbort(stream, emitter, partial);
+    } else if (error || (result && result.status === "error")) {
+      emitter.closeThinking();
+      emitter.closeText();
+      partial.stopReason = "error";
+      partial.errorMessage = sanitizeSdkError(error || new Error((result && result.error) || "Cursor SDK run failed"), apiKey);
+      stream.push({ type: "error", reason: "error", error: partial });
+    } else {
+      const streamed = emitter.currentText();
+      const finalText = (result && result.result) || "";
+      if (finalText && finalText.length > streamed.length && finalText.startsWith(streamed)) {
+        emitter.appendText(finalText.slice(streamed.length));
+      } else if (finalText && !streamed) {
+        emitter.appendText(finalText);
+      }
+      emitter.closeThinking();
+      emitter.closeText();
+      applySdkUsage(partial, liveRun.lastUsage);
+      partial.stopReason = "stop";
+      stream.push({ type: "done", reason: "stop", message: partial });
     }
-    emitter.closeThinking();
-    emitter.closeText();
-    applySdkUsage(partial, liveRun.lastUsage);
-    partial.stopReason = "stop";
-    stream.push({ type: "done", reason: "stop", message: partial });
-  }
+  } catch { /* stream already ended (idle/stale finalize) — nothing to emit */ }
   const rt = liveRun.resolveTurn;
   liveRun.resolveTurn = null;
   if (rt) rt();
@@ -2080,13 +2086,15 @@ async function startBridgeRun(sessionKey, stream, model, context, options) {
     return;
   }
 
-  const turn = sdkDeferred();
+  const turn = makeSdkDeferred();
   const liveRun = {
     agent: null, run: null, sendPromise: null,
     stream, partial, emitter, resolveTurn: turn.resolve,
     pendingTools: new Map(), toolNameMap: new Map(),
     flushScheduled: false, callSeq: 0, lastUsage: null,
     settled: false, aborted: false,
+    // H1/H2: stored so the idle timer and abort handler are self-contained.
+    sessionKey, apiKey, idleTimer: null, onAbort: null, abortSignal: null,
   };
   cursorLiveRuns.set(sessionKey, liveRun);
 
@@ -2099,20 +2107,29 @@ async function startBridgeRun(sessionKey, stream, model, context, options) {
   const prompt = hasTools
     ? `${bridgeSteeringPreamble(customNames)}\n${buildSdkPrompt(context)}`
     : buildSdkPrompt(context);
-  const images = collectSdkImages(context);
-
-  const signal = options && options.signal;
-  const onAbort = () => {
-    liveRun.aborted = true;
-    for (const [, d] of liveRun.pendingTools) { try { d.reject(makeSdkAbort()); } catch {} }
-    if (liveRun.run) liveRun.run.cancel().catch(() => {});
-  };
-  if (signal) {
-    if (signal.aborted) { liveRun.aborted = true; }
-    else signal.addEventListener("abort", onAbort, { once: true });
+  // M4: only attach images to vision-capable models; otherwise skip + log so a
+  // manually-routed image to a text-only model can't be sent with undefined
+  // behavior (Pi's UI normally gates this, but the code path must be safe).
+  const visionCapable = VISION_CAPABLE_SDK_MODELS.has(model.id);
+  const images = collectSdkImages(context, visionCapable);
+  if (!visionCapable) {
+    const dropped = collectSdkImages(context, true).length;
+    if (dropped) notifyCursor(`${dropped} image${dropped === 1 ? "" : "s"} not sent — model ${model.id} doesn't support image input.`);
   }
 
-  if (liveRun.aborted) { finalizeBridge(liveRun, sessionKey, null, makeSdkAbort(), apiKey); await turn.promise; return; }
+  // H2: define the abort handler once (it closes over the stable liveRun) and
+  // (re)bind it to each turn's signal via bindBridgeAbort. On abort it cancels
+  // the SDK run and finalizes — rejecting pending tools — on the current turn.
+  liveRun.onAbort = () => {
+    if (liveRun.settled) return;
+    liveRun.aborted = true;
+    notifyCursor("Cursor run cancelled.");
+    if (liveRun.run) { try { liveRun.run.cancel().catch(() => {}); } catch {} }
+    finalizeBridge(liveRun, liveRun.sessionKey, null, makeSdkAbort(), liveRun.apiKey);
+  };
+  bindBridgeAbort(liveRun, options && options.signal);
+
+  if (liveRun.aborted) { await turn.promise; return; }
 
   try {
     liveRun.agent = await sdk.Agent.create({
@@ -2138,20 +2155,28 @@ async function startBridgeRun(sessionKey, stream, model, context, options) {
   }
 
   await turn.promise;
+  // Turn yielded back to Pi. If the run is parked awaiting tool results (not
+  // settled), arm the idle timer so an abandoned turn can't leak. (H1)
+  if (!liveRun.settled) armBridgeIdle(liveRun);
 }
 
 /** Resume an in-flight live run: deliver tool results, continue streaming. */
-async function resumeBridgeRun(liveRun, stream, context, model) {
+async function resumeBridgeRun(liveRun, stream, context, model, options) {
+  clearBridgeIdle(liveRun); // Pi resumed in time — cancel the idle eviction. (H1)
   const partial = makeSdkInitialMessage(model);
   stream.push({ type: "start", partial });
   const emitter = new SdkPartialEmitter(stream, partial);
 
-  const turn = sdkDeferred();
+  const turn = makeSdkDeferred();
   liveRun.stream = stream;
   liveRun.partial = partial;
   liveRun.emitter = emitter;
   liveRun.resolveTurn = turn.resolve;
   liveRun.flushScheduled = false;
+
+  // H2: rebind the abort handler to THIS turn's signal so an abort on a resumed
+  // turn actually cancels the run and rejects pending tools.
+  bindBridgeAbort(liveRun, options && options.signal);
 
   // Deliver the tool results Pi just produced to the waiting agent.
   const results = getTrailingToolResults(context);
@@ -2166,6 +2191,8 @@ async function resumeBridgeRun(liveRun, stream, context, model) {
   queueMicrotask(() => surfacePendingTools(liveRun));
 
   await turn.promise;
+  // Parked again awaiting more tool results? Re-arm the idle timer. (H1)
+  if (!liveRun.settled) armBridgeIdle(liveRun);
 }
 
 /**
@@ -2178,9 +2205,15 @@ function streamCursorSdk(model, context, options) {
 
   (async () => {
     const existing = cursorLiveRuns.get(sessionKey);
-    if (existing && !existing.settled && existing.pendingTools.size > 0) {
-      await resumeBridgeRun(existing, stream, context, model);
+    if (existing && !existing.settled && existing.pendingTools.size > 0 && resumeMatches(existing, context)) {
+      await resumeBridgeRun(existing, stream, context, model, options);
     } else {
+      // H1: a non-matching live run under this key (e.g. the shared default key
+      // after an abandoned turn) is stale — finalize it before starting fresh so
+      // its pending tool calls aren't re-surfaced into this new conversation.
+      if (existing && !existing.settled) {
+        finalizeBridge(existing, existing.sessionKey, null, makeSdkAbort(), existing.apiKey);
+      }
       await startBridgeRun(sessionKey, stream, model, context, options);
     }
   })().catch((error) => {
@@ -2391,6 +2424,13 @@ async function tryRegisterSdkProvider(pi) {
 }
 
 export default async function (pi) {
+  // Load the pure helpers (see loadSdkHelpers) before anything uses them — the
+  // unhandledRejection guard below (isSdkRejection) and all request handling.
+  // A failure here is fatal and surfaces clearly at load, rather than as a
+  // confusing "undefined is not a function" on the first request.
+  await loadSdkHelpers();
+  activePi = pi; // capture for notifyCursor (used by the bridge abort handler)
+
   // The local @cursor/sdk leaks internal async rejections during agent
   // init/cancel (e.g. initializeIgnoreMapping's RxJS pipeline). Without a
   // handler these can crash the host or print scary stacks. Swallow ONLY
@@ -2398,9 +2438,14 @@ export default async function (pi) {
   // hidden. Registered once (reload-safe) to avoid accumulating handlers.
   if (!globalThis.__piCursorSdkRejectionGuard) {
     globalThis.__piCursorSdkRejectionGuard = true;
+    // PROCESS-GLOBAL side effect: this listener suppresses Node's default
+    // crash-on-unhandled-rejection for the WHOLE Pi process. We keep it
+    // deliberately — crashing all of Pi over one stray cross-turn SDK leak is
+    // worse than a log — but it now only swallows rejections whose TOP stack
+    // frame is inside @cursor/sdk (isSdkRejection). Everything else is logged so
+    // real application bugs stay visible rather than being silently dropped. (M5)
     process.on("unhandledRejection", (reason) => {
-      const stack = String((reason && reason.stack) || reason || "");
-      if (stack.includes("@cursor/sdk")) return; // known benign SDK leak
+      if (isSdkRejection(reason)) return; // benign cross-turn SDK leak
       console.error("[cursor-agent] unhandled rejection:", reason);
     });
   }
@@ -2425,7 +2470,10 @@ export default async function (pi) {
   let modelsCache = [];
   let modelsCacheTime = 0;
   let modelsCacheOrigin = null; // "disk" | "cli" | "stale-disk" | "fallback"
-  const CACHE_TTL = 60_000;
+  // L4: in-memory de-dupe window for repeated getModels() calls within one Pi
+  // session. Distinct from the on-disk DEFAULT_CACHE_TTL_MS (24 h) — renamed so
+  // the two TTLs can't be confused.
+  const MODEL_REFRESH_TTL_MS = 60_000;
   globalThis.__variantMap = {};          // populated alongside models
   globalThis.__modelContextWindows = {};  // cached per-model context windows
 
@@ -2436,6 +2484,12 @@ export default async function (pi) {
   pi.registerCommand("cursor-refresh-models", {
     description: "Refresh the Cursor model list (re-discovers via the active SDK or CLI backend)",
     handler: async (_args, ctx) => {
+      // M3: a mid-session /login changes the stored key — re-read it (a cheap
+      // file read) so the CLI spawns and the SDK backend pick up the new key
+      // without a Pi restart.
+      extractAuthKey();
+      setCursorSdkAuthKey(cachedAuthKey);
+
       // 1. Clear disk cache
       try { fs.unlinkSync(getCacheFilePath()); } catch {}
 
@@ -2466,7 +2520,15 @@ export default async function (pi) {
           cursorStatus.modelSource = "cursor-agent CLI";
         }
 
-        if (ctx.hasUI) {
+        // L5: discovering zero models is a failure to surface, not a "success".
+        if (count === 0) {
+          const warn = `No models discovered via ${via} — check auth (/login) and connectivity, then retry.`;
+          if (ctx.hasUI) {
+            pi.sendMessage({ customType: "cursor-agent", content: warn, display: true });
+          } else {
+            console.warn(`[cursor-agent] ${warn}`);
+          }
+        } else if (ctx.hasUI) {
           pi.sendMessage({
             customType: "cursor-agent",
             content: `Refreshed ${count} models via ${via}`,
@@ -2526,7 +2588,7 @@ export default async function (pi) {
       }
     }
 
-    if (modelsCache.length > 0 && Date.now() - modelsCacheTime < CACHE_TTL) {
+    if (modelsCache.length > 0 && Date.now() - modelsCacheTime < MODEL_REFRESH_TTL_MS) {
       return modelsCache;
     }
     try {
@@ -2719,6 +2781,10 @@ const DEFAULT_MAX_TOKENS = 16384;
  * conservatively; codex, nano, auto, composer and kimi families omitted until
  * confirmed. Hand-maintained like MODEL_CONTEXT_WINDOWS; re-applied by
  * /cursor-refresh-models.
+ *
+ * SYNC (L6): when Cursor adds or renames a vision model, add its SDK base id
+ * here. A missing id is treated as text-only (images are silently dropped), so
+ * keep this list current as the catalog evolves.
  */
 const VISION_CAPABLE_SDK_MODELS = new Set([
   // Claude — all 3+ tiers are multimodal (ids reconciled against Cursor.models.list()).
@@ -2736,6 +2802,11 @@ const VISION_CAPABLE_SDK_MODELS = new Set([
 /**
  * Per-model context window values.
  * Family-base keys cover all effort variants; standalone keys for raw IDs.
+ *
+ * SYNC (L6): hand-maintained — when Cursor ships a new model or changes a
+ * window, add/adjust its key here. Unknown ids fall back to
+ * FALLBACK_CONTEXT_WINDOW, so a missing entry degrades quietly rather than
+ * erroring; keep it current as the catalog evolves.
  */
 const MODEL_CONTEXT_WINDOWS = {
   // ── Claude families ──
