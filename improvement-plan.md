@@ -123,7 +123,9 @@
 
 ---
 
-## Phase 5 — Pi-native auth flow
+## Phase 5 — Pi-native auth flow ✅
+
+**Status:** Complete (2026-06-16) — implemented via #plan in `.rpiv/artifacts/plans/2026-06-16_08-54-12_phase5-pi-native-auth-flow.md`, validated in `.rpiv/artifacts/validation/2026-06-16_09-30-27_phase5-pi-native-auth-flow.md` (verdict: pass). Committed in `397d32f`. `extractAuthKey()` reads the Pi-stored key from `~/.pi/agent/auth.json` at startup, both CLI spawns inject `CURSOR_API_KEY`, and `getAuthHash()` gains a `pikey:`-prefixed branch so changing the key via `/login` invalidates the model cache. Original change #1 (registering the `/login` auth provider) needed no code — Pi's generic API-key auth flow already surfaces the `cursor-agent` provider; the SDK backend also resolves the same key (`resolveSdkApiKey`).
 
 **Goal.** Replace the external `cursor-agent login` requirement with pi-native auth via `/login` → "Use an API key" → "Cursor", so users set their key once and Pi remembers it.
 
@@ -209,8 +211,8 @@
 | 1 | Thinking/reasoning mapping | Medium | High — users can control model reasoning in Pi | ✅ Complete |
 | 2 | Context window per model | Low | Medium — accurate context display and compaction | ✅ Complete |
 | 3 | Disk model cache | Low | Medium — faster startups | ✅ Complete |
-| 4 | `/cursor-refresh-models` | Low | Medium — no reload needed for new models |
-| 5 | Pi-native auth flow | Medium | High — no external CLI login step |
+| 4 | `/cursor-refresh-models` | Low | Medium — no reload needed for new models | ✅ Complete |
+| 5 | Pi-native auth flow | Medium | High — no external CLI login step | ✅ Complete |
 | 6 | Image input | Low | Medium — image support in chat |
 | 7 | Optional `@cursor/sdk` backend | High | High — fixes model-routing reliability, unlocks deep integration | ✅ v1 (text+thinking) Complete |
 
