@@ -33,13 +33,13 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 // a STATIC `import "../lib/..."` fails at load. loadSdkHelpers() instead follows
 // this file's realpath back to the repo and dynamic-imports the module. The
 // bindings are populated by loadSdkHelpers() before any request is served.
-let collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens;
+let collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens, rebaseSdkUsageFields;
 
 async function loadSdkHelpers() {
   const selfReal = fs.realpathSync(fileURLToPath(import.meta.url));
   const helpersPath = path.join(path.dirname(selfReal), "..", "lib", "cursor-helpers.js");
   const helpers = await import(pathToFileURL(helpersPath).href);
-  ({ collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens } = helpers);
+  ({ collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens, rebaseSdkUsageFields } = helpers);
 }
 
 // ─── Session Management ──────────────────────────────────────────────────────
@@ -2075,7 +2075,7 @@ function finalizeBridge(liveRun, sessionKey, result, error, apiKey) {
       }
       emitter.closeThinking();
       emitter.closeText();
-      applySdkUsage(partial, liveRun.lastUsage, estimatePiContextTokens(liveRun));
+      applySdkUsage(partial, liveRun.lastUsage, estimatePiUsage(liveRun));
       partial.stopReason = "stop";
       stream.push({ type: "done", reason: "stop", message: partial });
     }
@@ -2114,8 +2114,8 @@ async function startBridgeRun(sessionKey, stream, model, context, options) {
     flushScheduled: false, callSeq: 0, lastUsage: null,
     settled: false, aborted: false,
     // Latest Pi context for this run, refreshed each turn (start + resume). Used
-    // by estimatePiContextTokens() at finalize to size the gauge off Pi's own
-    // conversation rather than Cursor's internal accounting.
+    // by estimatePiUsage() at finalize to size the gauge AND the overflow check
+    // off Pi's own conversation rather than Cursor's internal accounting.
     lastContext: context,
     // H1/H2: stored so the idle timer and abort handler are self-contained.
     sessionKey, apiKey, idleTimer: null, onAbort: null, abortSignal: null,
@@ -2258,63 +2258,80 @@ function streamCursorSdk(model, context, options) {
 /**
  * Apply usage to the Pi assistant message.
  *
- * The per-field counts (input/output/cacheRead/cacheWrite) are Cursor's REAL
- * reported numbers and pass through verbatim — Pi's footer sums them for the
- * token/cost stats (↑input ↓output Rcache CH%), so they must stay accurate.
+ * On the SDK backend Cursor reports usage for its OWN server-side agent context
+ * (a large system prompt + built-in tool schemas + the full internal tool-loop
+ * transcript) plus a CUMULATIVE, unbounded cacheRead — none of which is the
+ * conversation Pi holds, forwards, or can compact. Pi reads this usage for THREE
+ * things, and all three must be sized off Pi's conversation, not Cursor's:
+ *   1. context-fill gauge + threshold compaction → calculateContextTokens(usage)
+ *      = usage.totalTokens || sum(fields)
+ *   2. footer token/cost stats (↑input ↓output …) → the per-field counts
+ *   3. SILENT context-overflow detection → isContextOverflow() flags a successful
+ *      turn when usage.input + usage.cacheRead > model.contextWindow
+ * Forwarding Cursor's raw numbers leaves (3) tripping on EVERY successful turn —
+ * its input+cacheRead routinely dwarfs the model's window (cacheRead alone is
+ * cumulative) — which fires overflow-recovery compaction and then the
+ * "Cannot continue from message role: assistant" retry failure (the transcript
+ * ends on the assistant turn with nothing queued to continue from).
  *
- * `totalTokens` is treated separately. Pi derives BOTH its context-fill gauge and
- * its auto-compaction trigger from calculateContextTokens(usage), which is
- * `usage.totalTokens || sum(fields)`. Cursor's reported input reflects Cursor's
- * OWN server-side agent context (its large system prompt + built-in tool schemas +
- * the entire internal tool-loop transcript), not the conversation Pi holds and
- * resends — so a one-step turn reads ~83% full and can trip premature compaction
- * that can't even shrink the offending tokens (they live on Cursor's side). We
- * therefore set totalTokens to a Pi-side estimate of the actual forwarded
- * conversation (see estimatePiContextTokens) so the gauge tracks the compactable
- * context. When no estimate is supplied (or it's empty) we fall back to the field
- * sum, preserving the previous behavior.
+ * So we report Pi's OWN forwarded conversation across every field Pi compares to
+ * the window: input = the forwarded-prompt estimate, cacheRead/cacheWrite = 0,
+ * totalTokens = the prompt+output estimate (see estimatePiUsage). Only output
+ * stays Cursor's real model output — it is accurate, always small, and never
+ * part of the overflow comparison. This keeps the gauge, the footer, and overflow
+ * detection all tracking the compactable conversation in lockstep.
  *
  * @param {object} partial — the Pi AssistantMessage being finalized
- * @param {object|null} usage — Cursor's turn-ended usage (inputTokens, …)
- * @param {number} [contextTokens] — Pi-side conversation estimate for the gauge
+ * @param {object|null} usage — Cursor's turn-ended usage (only outputTokens is used)
+ * @param {{input: number, total: number}} [estimate] — Pi-side forwarded-conversation estimate
  */
-function applySdkUsage(partial, usage, contextTokens) {
+function applySdkUsage(partial, usage, estimate) {
+  let outputTokens;
   if (usage) {
-    partial.usage.input = usage.inputTokens ?? 0;
-    partial.usage.output = usage.outputTokens ?? 0;
-    partial.usage.cacheRead = usage.cacheReadTokens ?? 0;
-    partial.usage.cacheWrite = usage.cacheWriteTokens ?? 0;
+    outputTokens = usage.outputTokens ?? 0;
   } else {
     let outChars = 0;
     for (const block of partial.content) {
       if (block.type === "text") outChars += block.text.length;
       else if (block.type === "thinking") outChars += block.thinking.length;
     }
-    partial.usage.output = estimateSdkTokens(" ".repeat(outChars));
+    outputTokens = estimateSdkTokens(" ".repeat(outChars));
   }
-  partial.usage.totalTokens = (typeof contextTokens === "number" && contextTokens > 0)
-    ? contextTokens
-    : partial.usage.input + partial.usage.output + partial.usage.cacheRead + partial.usage.cacheWrite;
+  const fields = rebaseSdkUsageFields(outputTokens, estimate);
+  partial.usage.input = fields.input;
+  partial.usage.output = fields.output;
+  partial.usage.cacheRead = fields.cacheRead;
+  partial.usage.cacheWrite = fields.cacheWrite;
+  partial.usage.totalTokens = fields.totalTokens;
 }
 
 /**
- * Estimate the tokens of Pi's OWN conversation for this turn: the forwarded
- * system/preamble + messages + tool results (buildSdkPrompt) plus this turn's
- * model output. Uses the same chars/4 heuristic Pi's own estimateTokens() uses,
- * and counts assistant output blocks (text + thinking + toolCall name/args)
- * exactly as Pi does, so the gauge doesn't jump when this message later becomes a
- * "trailing" message in Pi's estimate.
+ * Estimate Pi's OWN forwarded conversation for this turn, sized for every Pi
+ * mechanism that reads usage (gauge, threshold compaction, AND silent-overflow
+ * detection — see applySdkUsage). Returns:
+ *   - input: the forwarded prompt only (system/preamble + messages + tool
+ *     results, via buildSdkPrompt) — the value Pi adds to cacheRead (now 0) for
+ *     its overflow check, so it must stay below the model's context window.
+ *   - total: input + this turn's assistant output blocks (text + thinking +
+ *     toolCall name/args), counted exactly as Pi's estimateTokens() counts an
+ *     assistant message — drives the context-fill gauge and threshold compaction.
+ *
+ * Uses the same chars/4 heuristic Pi's own estimateTokens() uses, so the values
+ * stay stable when Pi later re-estimates this message as a "trailing" message.
  *
  * Deliberately EXCLUDES Cursor's opaque server-side baseline (its system prompt +
- * built-in tool schemas + internal tool-loop transcript): Pi can neither see,
- * control, nor compact those tokens, so counting them would only mislead the
- * gauge and mis-fire compaction. When STRIP_SYSTEM_PROMPT is on (the default),
- * buildSdkPrompt already reflects the minimal preamble, so the estimate naturally
- * tracks the smaller forwarded payload.
+ * built-in tool schemas + internal tool-loop transcript + cumulative cacheRead):
+ * Pi can neither see, control, nor compact those tokens, so counting them would
+ * only mislead the gauge and mis-fire compaction/overflow. When STRIP_SYSTEM_PROMPT
+ * is on (the default), buildSdkPrompt already reflects the minimal preamble, so
+ * the estimate naturally tracks the smaller forwarded payload.
  */
-function estimatePiContextTokens(liveRun) {
+function estimatePiUsage(liveRun) {
   const promptText = liveRun.lastContext ? buildSdkPrompt(liveRun.lastContext) : "";
-  return estimateConversationTokens(promptText, liveRun.partial.content, SDK_APPROX_CHARS_PER_TOKEN);
+  return {
+    input: estimateSdkTokens(promptText),
+    total: estimateConversationTokens(promptText, liveRun.partial.content, SDK_APPROX_CHARS_PER_TOKEN),
+  };
 }
 
 function finalizeSdkAbort(stream, emitter, partial) {

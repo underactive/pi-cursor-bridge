@@ -115,13 +115,21 @@ Two consequences shape what Pi shows:
   duplicated context that inflates every turn's input tokens. The bridge replaces
   it with a minimal preamble (environment + date + cwd). Set
   `PI_CURSOR_STRIP_SYSTEM_PROMPT=0` to forward the full Pi system prompt instead.
-- **The context gauge reflects Pi's conversation, not Cursor's loop.** Cursor's
-  reported `inputTokens` measure Cursor's whole server-side context, which would
-  make even a one-step turn read as ~80%+ full and could trip premature
-  compaction. The bridge instead reports `totalTokens` as an estimate of the
-  *forwarded* conversation Pi actually holds and can compact. Cursor's real token
-  counts still appear in the footer's token/cost stats (`↑`/`↓`/`R`/`CH%`); only
-  the context-fill gauge is rebased onto Pi's own conversation.
+- **Usage reflects Pi's conversation, not Cursor's loop.** Cursor's reported
+  `inputTokens`/`cacheReadTokens` measure Cursor's whole server-side context plus
+  a cumulative, unbounded cache — not the conversation Pi forwards and can
+  compact. Pi reads usage for three things: the context-fill gauge + threshold
+  compaction (`totalTokens`), the footer stats (per-field counts), and **silent
+  context-overflow detection** (`input + cacheRead > contextWindow`). Echoing
+  Cursor's raw numbers makes the overflow check fire on *every* successful turn
+  (its `input + cacheRead` routinely dwarfs the window), which trips
+  overflow-recovery compaction and a `Cannot continue from message role:
+  assistant` retry failure. The bridge therefore sizes every field Pi compares to
+  the window off Pi's *forwarded* conversation: `input` = the forwarded-prompt
+  estimate, `cacheRead`/`cacheWrite` = `0`, `totalTokens` = the prompt+output
+  estimate. Only `output` (`↓`) stays Cursor's real model output. So the footer
+  shows `↑` (forwarded prompt) and `↓` (real output); the `R`/`CH%` cache stats
+  read `0` because Cursor's server-side cache is opaque to Pi.
 
 ## Pi commands
 
