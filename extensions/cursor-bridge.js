@@ -2162,6 +2162,11 @@ async function startBridgeRun(sessionKey, stream, model, context, options) {
       mode: "agent",
       local: hasTools ? { cwd: backendCwd, customTools } : { cwd: backendCwd },
     });
+    // H3: an abort can land while Agent.create() is awaited above. onAbort has
+    // already finalized the Pi turn but had no Run handle to cancel (and the
+    // signal fires once), so don't dispatch a send we'd only have to cancel —
+    // release the agent and bail before the SDK ever starts a run.
+    if (liveRun.aborted) { try { liveRun.agent.close(); } catch {} return; }
     liveRun.sendPromise = liveRun.agent.send(
       images.length ? { text: prompt, images } : { text: prompt },
       { onDelta: ({ update }) => handleBridgeDelta(liveRun, update) },
@@ -2170,6 +2175,13 @@ async function startBridgeRun(sessionKey, stream, model, context, options) {
     liveRun.sendPromise
       .then(async (run) => {
         liveRun.run = run;
+        // H3: cancel the race where the abort fired after send() dispatched but
+        // before its Run resolved. onAbort ran with liveRun.run still null, so it
+        // could only finalize the Pi turn — agent.close() merely releases the
+        // executor lease, it does NOT stop the in-flight run. Now that we hold the
+        // handle, Run.cancel() aborts the executor so Cursor actually stops
+        // instead of running its loop to completion.
+        if (liveRun.aborted) { try { await run.cancel(); } catch {} return; }
         const result = await run.wait();
         finalizeBridge(liveRun, sessionKey, result, null, apiKey);
       })
