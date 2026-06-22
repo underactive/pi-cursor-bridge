@@ -1281,11 +1281,13 @@ function startProxyServer(modelsFn) {
 /** @type {{ lines: string[] } | { error: string } | null} */
 let startupLog = null;
 
-let startupLogHandlerRegistered = false;
-
 function scheduleStartupLog(pi) {
-  if (startupLogHandlerRegistered) return;
-  startupLogHandlerRegistered = true;
+  // Use globalThis so the guard survives jiti module re-evaluation on /reload.
+  // Without this, each /reload resets the module-level flag and registers a
+  // duplicate session_start handler, causing the startup notification to appear
+  // N+1 times after N reloads.
+  if (globalThis.__piCursorBridgeStartupLogRegistered) return;
+  globalThis.__piCursorBridgeStartupLogRegistered = true;
 
   // Pi's default custom-message renderer inserts a blank line between the
   // [cursor-bridge] header and the content. Render it ourselves so the content
