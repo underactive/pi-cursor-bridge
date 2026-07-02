@@ -25,7 +25,7 @@
   ],
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/cursor-bridge.js"
     ]
   },
   "peerDependencies": {

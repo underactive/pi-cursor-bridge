@@ -55,21 +55,22 @@ Pi reads the `pi.extensions` field in `package.json` and auto-loads `extensions/
 
 ### Local clone
 
-Clone this repo and either:
-
-- Symlink the extension into a Pi extension directory:
-
-  ```sh
-  ln -s "$PWD/extensions/cursor-bridge.js" ~/.pi/agent/extensions/cursor-bridge.js
-  ```
-
-- Or symlink the whole `extensions/` directory contents into a project-local Pi dir (`.pi/extensions/`).
-
-Install dependencies so the SDK backend is available:
+Clone this repo, install dependencies, and symlink the repo root into a Pi
+extension directory — one symlink, no separate `node_modules` symlink needed:
 
 ```sh
 npm install
+ln -s "$PWD" ~/.pi/agent/extensions/cursor-bridge
 ```
+
+(Use `.pi/extensions/cursor-bridge` instead for a project-local install.)
+
+Pi's subdirectory auto-discovery reads this package's `package.json` →
+`pi.extensions` field (which points at `extensions/cursor-bridge.js`) and loads
+it from the real repo path the symlink resolves to, so `node_modules/`,
+`lib/cursor-helpers.js`, and everything else in the repo resolve normally —
+no need to symlink `extensions/cursor-bridge.js` and `node_modules/`
+separately.
 
 Then restart Pi or run `/reload`.
 
