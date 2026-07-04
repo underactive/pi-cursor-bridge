@@ -34,12 +34,14 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 // this file's realpath back to the repo and dynamic-imports the module. The
 // bindings are populated by loadSdkHelpers() before any request is served.
 let collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens, rebaseSdkUsageFields;
+let enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHints, normalizeBridgeToolArgs;
 
 async function loadSdkHelpers() {
   const selfReal = fs.realpathSync(fileURLToPath(import.meta.url));
   const helpersPath = path.join(path.dirname(selfReal), "..", "lib", "cursor-helpers.js");
   const helpers = await import(pathToFileURL(helpersPath).href);
-  ({ collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens, rebaseSdkUsageFields } = helpers);
+  ({ collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens, rebaseSdkUsageFields,
+    enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHints, normalizeBridgeToolArgs } = helpers);
 }
 
 // ─── Session Management ──────────────────────────────────────────────────────
@@ -1902,6 +1904,7 @@ function bridgeSessionKey(options) {
 
 /** Steering text so the model prefers the bridged Pi tools over built-ins. */
 function bridgeSteeringPreamble(toolNames) {
+  const hints = bridgeToolSteeringHints(toolNames);
   return [
     "## Environment",
     "You are running inside Pi. The following tools execute in the user's actual",
@@ -1910,6 +1913,7 @@ function bridgeSteeringPreamble(toolNames) {
     "ALWAYS use these tools for file reads/writes/edits, shell commands, and code",
     "search. Do NOT use any built-in equivalents — only the tools listed above act",
     "on the real workspace.",
+    ...(hints.length ? ["", "## Tool requirements", ...hints] : []),
     "",
   ].join("\n");
 }
@@ -1938,8 +1942,8 @@ function buildBridgeCustomTools(liveRun, tools) {
     const customName = `pi_${tool.name}`;
     liveRun.toolNameMap.set(customName, tool.name);
     customTools[customName] = {
-      description: tool.description || `Pi tool: ${tool.name}`,
-      inputSchema: tool.parameters || { type: "object" },
+      description: enhanceBridgeToolDescription(tool.name, tool.description || `Pi tool: ${tool.name}`),
+      inputSchema: enhanceBridgeInputSchema(tool.name, tool.parameters),
       execute: (args, ctx) => bridgeExecute(liveRun, tool.name, args, ctx),
     };
   }
@@ -1953,8 +1957,9 @@ function buildBridgeCustomTools(liveRun, tools) {
  */
 function bridgeExecute(liveRun, piToolName, args, ctx) {
   const toolCallId = (ctx && ctx.toolCallId) || `bridge-${liveRun.callSeq++}`;
+  const normalizedArgs = normalizeBridgeToolArgs(piToolName, args);
   const d = makeSdkDeferred();
-  liveRun.pendingTools.set(toolCallId, { d, piToolName, args, surfaced: false });
+  liveRun.pendingTools.set(toolCallId, { d, piToolName, args: normalizedArgs, surfaced: false });
   scheduleSurface(liveRun);
   return d.promise;
 }
