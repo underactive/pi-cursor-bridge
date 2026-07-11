@@ -1579,11 +1579,35 @@ function resolveSdkApiKey(optionApiKey) {
 /** @type {Record<string, object>} Pi model id → selection metadata. */
 let sdkMetadata = {};
 
+/**
+ * Default SDK model-discovery timeout (15 s).
+ * The SDK's models.list() has no built-in timeout, so a slow or unreachable
+ * Cursor API can hang the async extension factory indefinitely. This prevents
+ * that from freezing Pi startup or /reload. Configurable via env var.
+ */
+const SDK_DISCOVERY_TIMEOUT_MS = 15_000;
+
+function getSdkDiscoveryTimeout() {
+  const env = process.env.PI_CURSOR_SDK_DISCOVERY_TIMEOUT_MS;
+  if (env) {
+    const n = parseInt(env, 10);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  return SDK_DISCOVERY_TIMEOUT_MS;
+}
+
 /** Fetch the raw model catalog from the SDK. */
 async function discoverSdkModels(apiKey) {
   const sdk = await loadCursorSdk();
   if (!sdk) throw new Error("@cursor/sdk not available");
-  return sdk.Cursor.models.list({ apiKey });
+  const timeoutMs = getSdkDiscoveryTimeout();
+  const result = await Promise.race([
+    sdk.Cursor.models.list({ apiKey }),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`SDK model discovery timed out after ${timeoutMs}ms`)), timeoutMs),
+    ),
+  ]);
+  return result;
 }
 
 function sdkContextValueToTokens(value) {
