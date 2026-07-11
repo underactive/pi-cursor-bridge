@@ -191,6 +191,28 @@ const HEALTH_SERVICE_ID = "cursor-bridge";
 const MAX_NONSTREAM_STDOUT_BYTES = 16 * 1024 * 1024;
 
 /**
+ * Force every Cursor run into a read-only conversation mode.
+ *
+ * Set PI_CURSOR_FORCE_MODE=plan (or ask) in the environment when embedding the
+ * bridge in a flow that must never mutate the workspace — e.g. pi plan-mode
+ * subagents (pi-moa-plan spawns its proposer/synthesizer children with this
+ * var). Without it, Cursor models run as full agents with their OWN local
+ * edit/shell tools, so pi-side tool allowlists cannot stop them from writing.
+ *
+ * SDK runs map both values to mode "plan" (the SDK only knows agent|plan);
+ * CLI runs pass --mode plan/ask and drop --force (auto-approve).
+ *
+ * Read per-run (not once at load) so a host extension living in the SAME pi
+ * process (e.g. plan mode toggling on/off) can set/clear the var dynamically.
+ * Note: SDK agents reused across turns keep the mode they were created with;
+ * only newly created runs pick up a change.
+ */
+function forceMode() {
+  const v = (process.env.PI_CURSOR_FORCE_MODE || "").toLowerCase();
+  return v === "plan" || v === "ask" ? v : null;
+}
+
+/**
  * Resolve the cursor-agent binary path.
  */
 function resolveCursorAgent() {
@@ -897,8 +919,14 @@ function handleChatCompletions(req, res) {
     // that input is complete. The subprocess exits after processing.
     const args = [
       "--output-format", "stream-json",
-      "--model", effectiveModel, "--trust", "--force",
+      "--model", effectiveModel, "--trust",
     ];
+    // Read-only override: in plan/ask mode the CLI itself refuses edits, and
+    // --force (auto-approve every tool) must not be passed. Otherwise keep the
+    // historical headless default of auto-approved tools.
+    const cliForceMode = forceMode();
+    if (cliForceMode) args.push("--mode", cliForceMode);
+    else args.push("--force");
     if (stream) {
       args.push("--stream-partial-output");
     }
@@ -2198,7 +2226,9 @@ async function startBridgeRun(sessionKey, stream, model, context, options) {
     liveRun.agent = await sdk.Agent.create({
       apiKey,
       model: selection,
-      mode: "agent",
+      // "plan" is Cursor's native read-only mode — no local file edits or
+      // shell. Forced via PI_CURSOR_FORCE_MODE for planning-only embeddings.
+      mode: forceMode() ? "plan" : "agent",
       local: hasTools ? { cwd: backendCwd, customTools } : { cwd: backendCwd },
     });
     // H3: an abort can land while Agent.create() is awaited above. onAbort has
@@ -2535,6 +2565,7 @@ function getCursorStatusLines() {
   const rg = process.env.CURSOR_RIPGREP_PATH;
   return [
     `Backend:   ${cursorStatus.backend}`,
+    ...(forceMode() ? [`Mode:      forced ${forceMode()} (PI_CURSOR_FORCE_MODE — read-only runs)`] : []),
     `Detail:    ${cursorStatus.reason}`,
     `Models:    ${cursorStatus.modelCount}${cursorStatus.modelSource ? ` (${cursorStatus.modelSource})` : ""}`,
     `Auth:      ${authSource}`,

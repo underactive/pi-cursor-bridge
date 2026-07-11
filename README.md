@@ -194,6 +194,7 @@ Environment variables (set before Pi loads the extension):
 | `PI_CURSOR_SDK_DISABLE=1` | Force CLI/proxy backend instead of `@cursor/sdk` |
 | `PI_CURSOR_STRIP_SYSTEM_PROMPT=0` | **Opt out** of stripping Pi's system prompt on the SDK backend (stripping is ON by default — see [SDK backend: context gauge](#sdk-backend-context-gauge)) |
 | `PI_CURSOR_AGENT_PATH` | Absolute path to a custom `cursor-agent` binary |
+| `PI_CURSOR_FORCE_MODE=plan` (or `ask`) | Force every Cursor run into a **read-only** mode: SDK runs use Cursor's native `plan` mode; CLI runs get `--mode plan`/`ask` and drop `--force`. Set this when embedding the bridge in flows that must never mutate the workspace (pi-moa-plan sets it for plan-mode subagents — Cursor models are full agents with their own local edit/shell tools, so pi tool allowlists alone cannot stop them from writing) |
 | `CURSOR_API_KEY` | Cursor API key for SDK and CLI spawns |
 | `PI_CURSOR_DISABLE_MODEL_CACHE=1` | Disable on-disk model cache |
 | `PI_CURSOR_MODEL_CACHE_TTL_MS` | Disk cache TTL in milliseconds (default: 24 h) |
