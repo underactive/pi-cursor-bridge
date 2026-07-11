@@ -34,14 +34,14 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 // this file's realpath back to the repo and dynamic-imports the module. The
 // bindings are populated by loadSdkHelpers() before any request is served.
 let collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens, rebaseSdkUsageFields;
-let enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHints, normalizeBridgeToolArgs;
+let enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHints, normalizeBridgeToolArgs, isBridgeToolAbortResult;
 
 async function loadSdkHelpers() {
   const selfReal = fs.realpathSync(fileURLToPath(import.meta.url));
   const helpersPath = path.join(path.dirname(selfReal), "..", "lib", "cursor-helpers.js");
   const helpers = await import(pathToFileURL(helpersPath).href);
   ({ collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens, rebaseSdkUsageFields,
-    enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHints, normalizeBridgeToolArgs } = helpers);
+    enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHints, normalizeBridgeToolArgs, isBridgeToolAbortResult } = helpers);
 }
 
 // ─── Session Management ──────────────────────────────────────────────────────
@@ -1956,6 +1956,7 @@ function buildBridgeCustomTools(liveRun, tools) {
  * delivers the tool result on a later streamSimple call.
  */
 function bridgeExecute(liveRun, piToolName, args, ctx) {
+  if (liveRun.aborted || liveRun.settled) return Promise.reject(makeSdkAbort());
   const toolCallId = (ctx && ctx.toolCallId) || `bridge-${liveRun.callSeq++}`;
   const normalizedArgs = normalizeBridgeToolArgs(piToolName, args);
   const d = makeSdkDeferred();
@@ -1999,6 +2000,7 @@ function surfacePendingTools(liveRun) {
 }
 
 function handleBridgeDelta(liveRun, update) {
+  if (liveRun.aborted || liveRun.settled) return;
   switch (update.type) {
     case "text-delta": liveRun.emitter.appendText(update.text); break;
     case "thinking-delta": liveRun.emitter.appendThinking(update.text); break;
@@ -2035,6 +2037,18 @@ function resumeMatches(liveRun, context) {
     if (tr.toolCallId && liveRun.pendingTools.has(tr.toolCallId)) return true;
   }
   return false;
+}
+
+function hasTrailingBridgeToolAbort(context) {
+  return getTrailingToolResults(context).some((tr) => isBridgeToolAbortResult(tr));
+}
+
+function abortBridgeRun(liveRun, notify = true) {
+  if (liveRun.settled) return;
+  liveRun.aborted = true;
+  if (notify) notifyCursor("Cursor run cancelled.");
+  if (liveRun.run) { try { liveRun.run.cancel().catch(() => {}); } catch {} }
+  finalizeBridge(liveRun, liveRun.sessionKey, null, makeSdkAbort(), liveRun.apiKey);
 }
 
 /** (Re)bind the abort handler to the CURRENT turn's AbortSignal. Pi delivers a
@@ -2151,13 +2165,7 @@ async function startBridgeRun(sessionKey, stream, model, context, options) {
   // H2: define the abort handler once (it closes over the stable liveRun) and
   // (re)bind it to each turn's signal via bindBridgeAbort. On abort it cancels
   // the SDK run and finalizes — rejecting pending tools — on the current turn.
-  liveRun.onAbort = () => {
-    if (liveRun.settled) return;
-    liveRun.aborted = true;
-    notifyCursor("Cursor run cancelled.");
-    if (liveRun.run) { try { liveRun.run.cancel().catch(() => {}); } catch {} }
-    finalizeBridge(liveRun, liveRun.sessionKey, null, makeSdkAbort(), liveRun.apiKey);
-  };
+  liveRun.onAbort = () => abortBridgeRun(liveRun);
   bindBridgeAbort(liveRun, options && options.signal);
 
   if (liveRun.aborted) { await turn.promise; return; }
@@ -2223,9 +2231,18 @@ async function resumeBridgeRun(liveRun, stream, context, model, options) {
   // H2: rebind the abort handler to THIS turn's signal so an abort on a resumed
   // turn actually cancels the run and rejects pending tools.
   bindBridgeAbort(liveRun, options && options.signal);
+  if (liveRun.aborted || liveRun.settled) { await turn.promise; return; }
 
-  // Deliver the tool results Pi just produced to the waiting agent.
+  // Deliver the tool results Pi just produced to the waiting agent. If the user
+  // cancelled while Pi was executing a bridged tool, Pi resumes us with an error
+  // toolResult such as "Operation aborted". Do NOT feed that back to Cursor as a
+  // normal tool failure, or the parked SDK run will continue working after Esc.
   const results = getTrailingToolResults(context);
+  if (results.some((tr) => tr.toolCallId && liveRun.pendingTools.has(tr.toolCallId) && isBridgeToolAbortResult(tr))) {
+    abortBridgeRun(liveRun);
+    await turn.promise;
+    return;
+  }
   for (const tr of results) {
     const p = liveRun.pendingTools.get(tr.toolCallId);
     if (p) { liveRun.pendingTools.delete(tr.toolCallId); p.d.resolve(toolResultToString(tr)); }
@@ -2253,6 +2270,10 @@ function streamCursorSdk(model, context, options) {
     const existing = cursorLiveRuns.get(sessionKey);
     if (existing && !existing.settled && existing.pendingTools.size > 0 && resumeMatches(existing, context)) {
       await resumeBridgeRun(existing, stream, context, model, options);
+    } else if (hasTrailingBridgeToolAbort(context)) {
+      if (existing && !existing.settled) abortBridgeRun(existing, false);
+      const partial = makeSdkInitialMessage(model);
+      finalizeSdkAbort(stream, new SdkPartialEmitter(stream, partial), partial);
     } else {
       // H1: a non-matching live run under this key (e.g. the shared default key
       // after an abandoned turn) is stale — finalize it before starting fresh so
