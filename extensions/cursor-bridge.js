@@ -39,6 +39,7 @@ let parseModelId, buildModelFamilies, resolveModelVariant, stripContextSuffix, e
 
 let CursorSession, SessionManager, getSessionTimeout, DEFAULT_SESSION_TIMEOUT_MS;
 let DISABLE_MODEL_CACHE, getCacheTTL, getCacheFilePath, getAuthHash, loadModelCache, saveModelCache;
+let ModelCatalog;
 let forceMode, homeDir, resolveCursorAgent, cursorAgentPath, cursorAgentEnv, fetchCursorModels,
   buildPromptFromMessages, normalizeModel, formatCursorError;
 let FALLBACK_MODELS, FALLBACK_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, VISION_CAPABLE_SDK_MODELS,
@@ -70,7 +71,17 @@ async function loadSdkHelpers() {
     buildPromptFromMessages, normalizeModel, formatCursorError } = await importLib("cursor-cli.js"));
 
   ({ DISABLE_MODEL_CACHE, getCacheTTL, getCacheFilePath, getAuthHash, loadModelCache, saveModelCache } = await importLib("model-cache.js"));
+
+  ({ ModelCatalog } = await importLib("model-catalog.js"));
 }
+
+/**
+ * Active model catalog (family variant map). Instantiated by the default
+ * export before the proxy serves requests; replaced content-wise by
+ * adoptModels()/clear() (see the L5 note in lib/model-catalog.js).
+ * @type {import("../lib/model-catalog.js").ModelCatalog|null}
+ */
+let modelCatalog = null;
 
 // ─── Config ───────────────────────────────────────────────────────────
 
@@ -164,10 +175,10 @@ function handleChatCompletions(req, res) {
     // not family base names (e.g. "gpt-5.5"). resolveModelVariant handles
     // both with and without reasoning_effort — when absent, it returns
     // the default variant.
-    // L5: snapshot the variant map once. /cursor-refresh-models reassigns the
-    // global mid-flight; capturing a stable reference here keeps this request
-    // reading one consistent map instead of a half-cleared one.
-    const variantMap = (typeof __variantMap !== "undefined") ? __variantMap : null;
+    // L5: snapshot the variant map once. /cursor-refresh-models replaces the
+    // catalog's map mid-flight; capturing a stable reference here keeps this
+    // request reading one consistent map instead of a half-cleared one.
+    const variantMap = modelCatalog ? modelCatalog.variantMap : null;
     if (variantMap) {
       const resolved = resolveModelVariant(cursorModel, reasoning_effort, variantMap);
       if (resolved) {
@@ -1979,8 +1990,7 @@ export default async function (pi) {
   // session. Distinct from the on-disk DEFAULT_CACHE_TTL_MS (24 h) — renamed so
   // the two TTLs can't be confused.
   const MODEL_REFRESH_TTL_MS = 60_000;
-  globalThis.__variantMap = {};          // populated alongside models
-  globalThis.__modelContextWindows = {};  // cached per-model context windows
+  modelCatalog = new ModelCatalog(); // populated alongside models by adoptModels()
 
   // Register /cursor-refresh-models command early so it's available on all
   // startup paths (new proxy, peer-attach, and disabled). The handler
@@ -2002,8 +2012,7 @@ export default async function (pi) {
       modelsCache = [];
       modelsCacheTime = 0;
       modelsCacheOrigin = null;
-      globalThis.__variantMap = {};
-      globalThis.__modelContextWindows = {};
+      modelCatalog.clear();
 
       // 3. Re-register. Prefer the SDK backend (re-discovers its catalog);
       //    otherwise re-fetch from the CLI (disk cache cleared → hits CLI).
@@ -2077,8 +2086,7 @@ export default async function (pi) {
 
   /**
    * Adopt a model list as the active set: update the in-memory cache, rebuild
-   * the variant map and per-model context windows, and record the cache
-   * timestamp + origin.
+   * the catalog's variant map, and record the cache timestamp + origin.
    *
    * @param {Array} models — model objects to adopt
    * @param {string} origin — "disk" | "cli" | "stale-disk" | "fallback"
@@ -2087,9 +2095,7 @@ export default async function (pi) {
    */
   function adoptModels(models, origin, cachedAt) {
     modelsCache = models;
-    const { variantMap: vm } = buildModelFamilies(modelsCache);
-    globalThis.__variantMap = vm;
-    globalThis.__modelContextWindows = buildModelContextWindows(modelsCache);
+    modelCatalog.adopt(modelsCache);
     modelsCacheTime = cachedAt ?? Date.now();
     modelsCacheOrigin = origin;
   }
@@ -2249,31 +2255,3 @@ export default async function (pi) {
   }
 }
 
-// ─── Model context window cache builder ─────────────────────────────────────
-
-/**
- * Build a cache mapping each model ID to its context window.
- * Used for quick runtime lookup without re-parsing the model ID.
- * @param {Array<{id: string}>} models — raw model objects from cursor-agent or FALLBACK_MODELS
- * @returns {Record<string, number>}
- */
-function buildModelContextWindows(models) {
-  const cwCache = {};
-  for (const m of models) {
-    // Prefer per-model contextWindow from CLI display-name parsing
-    if (m.contextWindow) {
-      cwCache[m.id] = m.contextWindow;
-      continue;
-    }
-    const parsed = parseModelId(m.id);
-    let key;
-    if (parsed) {
-      key = parsed.base;
-    } else {
-      // Strip -fast for standalone model lookup (matches standalone loop in buildModelConfigs)
-      key = m.id.endsWith("-fast") ? m.id.slice(0, -5) : m.id;
-    }
-    cwCache[m.id] = MODEL_CONTEXT_WINDOWS[key] ?? FALLBACK_CONTEXT_WINDOW;
-  }
-  return cwCache;
-}
