@@ -2054,12 +2054,40 @@ function surfacePendingTools(liveRun) {
 function handleBridgeDelta(liveRun, update) {
   if (liveRun.aborted || liveRun.settled) return;
   switch (update.type) {
-    case "text-delta": liveRun.emitter.appendText(update.text); break;
-    case "thinking-delta": liveRun.emitter.appendThinking(update.text); break;
+    case "text-delta": liveRun.emitter.appendText(update.text); updateLiveSdkUsage(liveRun); break;
+    case "thinking-delta": liveRun.emitter.appendThinking(update.text); updateLiveSdkUsage(liveRun); break;
     case "thinking-completed": liveRun.emitter.closeThinking(); break;
     case "turn-ended": if (update.usage) liveRun.lastUsage = update.usage; break;
     default: break; // tool-call-* deltas are emitted by bridgeExecute, not here
   }
+}
+
+/**
+ * Throttled live context-usage estimate, applied to the in-flight partial
+ * message while the SDK agent streams. Without this, `partial.usage` stays
+ * all-zero until finalizeBridge() runs applySdkUsage(), so any live context
+ * gauge (Pi's own, or a subagent progress widget) sits at 0% for the whole
+ * run. Uses the same Pi-side estimates as finalize (prompt via buildSdkPrompt
+ * + streamed output blocks), so the final applySdkUsage() values land on the
+ * same scale. Prompt estimate is cached per context snapshot; recomputed at
+ * most every 500ms.
+ */
+function updateLiveSdkUsage(liveRun) {
+  const now = Date.now();
+  if (liveRun.liveUsageAt && now - liveRun.liveUsageAt < 500) return;
+  liveRun.liveUsageAt = now;
+  if (liveRun.livePromptText == null || liveRun.livePromptContext !== liveRun.lastContext) {
+    liveRun.livePromptContext = liveRun.lastContext;
+    try {
+      liveRun.livePromptText = liveRun.lastContext ? buildSdkPrompt(liveRun.lastContext) : "";
+    } catch {
+      liveRun.livePromptText = "";
+    }
+  }
+  const u = liveRun.partial && liveRun.partial.usage;
+  if (!u) return;
+  u.input = estimateSdkTokens(liveRun.livePromptText);
+  u.totalTokens = estimateConversationTokens(liveRun.livePromptText, liveRun.partial.content, SDK_APPROX_CHARS_PER_TOKEN);
 }
 
 /** Clear a parked run's idle-eviction timer. (H1) */
