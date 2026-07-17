@@ -26,3 +26,4 @@ npm-debug.log*
 
 # Pi shadow tree (if used)
 .rpiv/
+.pi/

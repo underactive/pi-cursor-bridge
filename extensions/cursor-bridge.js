@@ -605,18 +605,6 @@ function normalizeModel(modelId) {
 // ../lib/cursor-helpers.js (pure, unit-tested) and are bound by loadSdkHelpers().
 
 /**
- * Determine if a model has a family that supports reasoning.
- */
-function supportsReasoning(modelId, familyData) {
-  const parsed = parseModelId(modelId);
-  if (parsed && familyData.variantMap[parsed.base]) {
-    const entry = familyData.variantMap[parsed.base];
-    return Object.keys(entry.variants).length >= 1 || Object.keys(entry.thinkingVariants).length >= 1;
-  }
-  return false;
-}
-
-/**
  * Parse common cursor-agent errors into user-friendly messages.
  */
 function formatCursorError(stderr) {
@@ -2883,21 +2871,6 @@ function contextWindowToSuffix(cw) {
   return `${Math.round(cw / 1000)}k`;
 }
 
-/**
- * Parse a context suffix like "1m" or "272k" into a numeric value.
- * @param {string} suffix — context suffix (with or without leading @)
- * @returns {number}
- */
-function parseContextWindow(suffix) {
-  if (!suffix) return FALLBACK_CONTEXT_WINDOW;
-  const s = suffix.replace(/^@/, "");
-  const m = s.match(/^(\d+)([km])$/i);
-  if (!m) return FALLBACK_CONTEXT_WINDOW;
-  const num = parseInt(m[1], 10);
-  const unit = m[2].toLowerCase();
-  return unit === "m" ? num * 1_000_000 : num * 1_000;
-}
-
 // ─── Model context window cache builder ─────────────────────────────────────
 
 /**
@@ -2925,37 +2898,4 @@ function buildModelContextWindows(models) {
     cwCache[m.id] = MODEL_CONTEXT_WINDOWS[key] ?? FALLBACK_CONTEXT_WINDOW;
   }
   return cwCache;
-}
-
-/**
- * Fallback context window map: maps every FALLBACK_MODELS ID to its
- * context window, resolved through family-base or standalone key lookup.
- * Ensures every fallback model ID has an accurate context window even
- * when the live cursor-agent models fetch fails.
- */
-// Lazy (function, not module-scope const): parseModelId is bound by
-// loadSdkHelpers() after module evaluation, so this must not run at import time.
-function buildFallbackModelContextWindows() {
-  return Object.fromEntries(
-    FALLBACK_MODELS.map(id => {
-      const parsed = parseModelId(id);
-      const key = parsed ? parsed.base : id;
-      return [id, MODEL_CONTEXT_WINDOWS[key] ?? FALLBACK_CONTEXT_WINDOW];
-    })
-  );
-}
-
-/**
- * Fallback max tokens map: mirrors buildFallbackModelContextWindows() keys.
- * Ensures every fallback model ID has a max tokens value. Lazy for the same
- * reason as buildFallbackModelContextWindows.
- */
-function buildFallbackMaxTokensMap() {
-  return Object.fromEntries(
-    Object.keys(buildFallbackModelContextWindows()).map(id => {
-      const parsed = parseModelId(id);
-      const key = parsed ? parsed.base : id;
-      return [id, MAX_TOKENS_MAP[key] ?? DEFAULT_MAX_TOKENS];
-    })
-  );
 }
