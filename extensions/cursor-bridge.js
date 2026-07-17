@@ -37,150 +37,26 @@ let collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimat
 let enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHints, normalizeBridgeToolArgs, isBridgeToolAbortResult;
 let parseModelId, buildModelFamilies, resolveModelVariant, stripContextSuffix, extractContextSuffix;
 
-async function loadSdkHelpers() {
+let CursorSession, SessionManager, getSessionTimeout, DEFAULT_SESSION_TIMEOUT_MS;
+
+/**
+ * Dynamic-import a module from ../lib/ following this file's realpath
+ * (symlink-safe — see the comment above the binding declarations).
+ * @param {string} relName — file name inside ../lib/ (e.g. "sessions.js")
+ */
+async function importLib(relName) {
   const selfReal = fs.realpathSync(fileURLToPath(import.meta.url));
-  const helpersPath = path.join(path.dirname(selfReal), "..", "lib", "cursor-helpers.js");
-  const helpers = await import(pathToFileURL(helpersPath).href);
+  const libPath = path.join(path.dirname(selfReal), "..", "lib", relName);
+  return import(pathToFileURL(libPath).href);
+}
+
+async function loadSdkHelpers() {
+  const helpers = await importLib("cursor-helpers.js");
   ({ collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens, rebaseSdkUsageFields,
     enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHints, normalizeBridgeToolArgs, isBridgeToolAbortResult,
     parseModelId, buildModelFamilies, resolveModelVariant, stripContextSuffix, extractContextSuffix } = helpers);
-}
 
-// ─── Session Management ──────────────────────────────────────────────────────
-
-/**
- * Default session idle timeout (5 minutes in ms).
- * After this period of inactivity, the session and its subprocess are
- * released. Configurable via PI_CURSOR_SESSION_TIMEOUT_MS.
- */
-const DEFAULT_SESSION_TIMEOUT_MS = 300_000;
-
-function getSessionTimeout() {
-  const env = process.env.PI_CURSOR_SESSION_TIMEOUT_MS;
-  if (env) {
-    const n = parseInt(env, 10);
-    if (!isNaN(n) && n > 0) return n;
-  }
-  return DEFAULT_SESSION_TIMEOUT_MS;
-}
-
-/**
- * Tracks one cursor-agent session: the pinned model id and the live subprocess
- * for an `X-Session-Id` conversation, plus idle-timeout bookkeeping. Prompt
- * text is always rebuilt from the request body (OpenAI convention), so no
- * message history or cumulative usage is retained here.
- */
-class CursorSession {
-  /**
-   * @param {string} sessionId — UUID or caller-provided session identifier
-   * @param {string} modelId — resolved cursor-agent model ID (--model arg)
-   */
-  constructor(sessionId, modelId) {
-    this.sessionId = sessionId;
-    this.modelId = modelId;
-    this.subprocessRef = null;
-    this.createdAt = Date.now();
-    this.lastActivityAt = Date.now();
-  }
-
-  touch() { this.lastActivityAt = Date.now(); }
-
-  isExpired(timeoutMs) {
-    const ttl = timeoutMs ?? getSessionTimeout();
-    return Date.now() - this.lastActivityAt > ttl;
-  }
-}
-
-/**
- * Manages the lifecycle of all active CursorSession instances.
- */
-class SessionManager {
-  constructor() {
-    this._sessions = new Map();
-    this._releaseTimers = new Map();
-  }
-
-  getOrCreateSession(sessionId, modelId) {
-    if (!sessionId) {
-      return new CursorSession("", modelId);
-    }
-
-    let session = this._sessions.get(sessionId);
-    if (session) {
-      const timer = this._releaseTimers.get(sessionId);
-      if (timer) {
-        clearTimeout(timer);
-        this._releaseTimers.delete(sessionId);
-      }
-      session.touch();
-      return session;
-    }
-
-    session = new CursorSession(sessionId, modelId);
-    this._sessions.set(sessionId, session);
-    return session;
-  }
-
-  getSession(sessionId) {
-    return this._sessions.get(sessionId) ?? null;
-  }
-
-  releaseSession(sessionId, timeoutMs) {
-    const session = this._sessions.get(sessionId);
-    if (!session) return;
-
-    if (this._releaseTimers.has(sessionId)) return;
-
-    const ttl = timeoutMs ?? getSessionTimeout();
-    const timer = setTimeout(() => {
-      this._cleanupSession(sessionId);
-    }, ttl);
-
-    if (timer.unref) timer.unref();
-    this._releaseTimers.set(sessionId, timer);
-  }
-
-  removeSession(sessionId) {
-    this._cleanupSession(sessionId);
-  }
-
-  cleanup(timeoutMs) {
-    const ttl = timeoutMs ?? getSessionTimeout();
-    const now = Date.now();
-    for (const [id, session] of this._sessions) {
-      if (now - session.lastActivityAt > ttl) {
-        this._cleanupSession(id);
-      }
-    }
-  }
-
-  destroy() {
-    for (const [id] of this._sessions) {
-      this._cleanupSession(id);
-    }
-    for (const [id, timer] of this._releaseTimers) {
-      clearTimeout(timer);
-      this._releaseTimers.delete(id);
-    }
-  }
-
-  _cleanupSession(sessionId) {
-    const session = this._sessions.get(sessionId);
-    if (!session) return;
-
-    const child = session.subprocessRef;
-    if (child && !child.killed) {
-      try { child.kill(); } catch {}
-    }
-
-    const timer = this._releaseTimers.get(sessionId);
-    if (timer) {
-      clearTimeout(timer);
-      this._releaseTimers.delete(sessionId);
-    }
-
-    this._sessions.delete(sessionId);
-  }
+  ({ CursorSession, SessionManager, getSessionTimeout, DEFAULT_SESSION_TIMEOUT_MS } = await importLib("sessions.js"));
 }
 
 // ─── Config ───────────────────────────────────────────────────────────
