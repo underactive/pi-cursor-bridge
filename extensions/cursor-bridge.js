@@ -38,6 +38,7 @@ let enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHi
 let parseModelId, buildModelFamilies, resolveModelVariant, stripContextSuffix, extractContextSuffix;
 
 let CursorSession, SessionManager, getSessionTimeout, DEFAULT_SESSION_TIMEOUT_MS;
+let DISABLE_MODEL_CACHE, getCacheTTL, getCacheFilePath, getAuthHash, loadModelCache, saveModelCache;
 let forceMode, homeDir, resolveCursorAgent, cursorAgentPath, cursorAgentEnv, fetchCursorModels,
   buildPromptFromMessages, normalizeModel, formatCursorError;
 let FALLBACK_MODELS, FALLBACK_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, VISION_CAPABLE_SDK_MODELS,
@@ -67,6 +68,8 @@ async function loadSdkHelpers() {
 
   ({ forceMode, homeDir, resolveCursorAgent, cursorAgentPath, cursorAgentEnv, fetchCursorModels,
     buildPromptFromMessages, normalizeModel, formatCursorError } = await importLib("cursor-cli.js"));
+
+  ({ DISABLE_MODEL_CACHE, getCacheTTL, getCacheFilePath, getAuthHash, loadModelCache, saveModelCache } = await importLib("model-cache.js"));
 }
 
 // ─── Config ───────────────────────────────────────────────────────────
@@ -79,21 +82,6 @@ const HEALTH_SERVICE_ID = "cursor-bridge";
 const MAX_NONSTREAM_STDOUT_BYTES = 16 * 1024 * 1024;
 
 // ─── Cache Infrastructure ────────────────────────────────────────────────
-
-/**
- * Default TTL for the disk model cache (24 hours in ms).
- */
-const DEFAULT_CACHE_TTL_MS = 86_400_000;
-
-/**
- * Cache file format version. Bump if the on-disk schema changes.
- */
-const CACHE_FORMAT_VERSION = 2;
-
-/**
- * Whether the disk model cache is disabled.
- */
-const DISABLE_MODEL_CACHE = process.env.PI_CURSOR_DISABLE_MODEL_CACHE === "1";
 
 /**
  * Cached API key from ~/.pi/agent/auth.json.
@@ -129,184 +117,6 @@ function extractAuthKey() {
   }
   cachedAuthKey = null;
   return null;
-}
-
-/**
- * Resolve the cache TTL from env var or default (24h).
- */
-function getCacheTTL() {
-  const env = process.env.PI_CURSOR_MODEL_CACHE_TTL_MS;
-  if (env) {
-    const n = parseInt(env, 10);
-    if (!isNaN(n) && n > 0) return n;
-  }
-  return DEFAULT_CACHE_TTL_MS;
-}
-
-/**
- * Resolve the cache file path: ~/.pi/agent/cursor-bridge-model-cache.json
- */
-function getCacheFilePath() {
-  return path.join(homeDir(), ".pi", "agent", "cursor-bridge-model-cache.json");
-}
-
-/**
- * Read Cursor auth state and return a SHA-256 hex hash.
- *
- * Sources (in priority order):
- *   1. CURSOR_API_KEY env var
- *   2. ~/.pi/agent/auth.json (Pi AuthStorage — populated by /login)
- *   3. ~/.cursor/cli-config.json (authInfo + serverConfigCache)
- *   4. Unauthenticated sentinel
- *
- * @returns {string} hex-encoded SHA-256 hash
- */
-function getAuthHash() {
-  // L4 — auth-source layering (intentional precedence):
-  //   1. CURSOR_API_KEY env — an explicit override always wins.
-  //   2. Pi-stored key from /login (`pikey:`) — the Pi-native default (Phase 5).
-  //   3. ~/.cursor/cli-config.json — the cursor-agent CLI's own login.
-  //   4. "unauthenticated" sentinel.
-  // This hash only keys the on-disk model cache, so env-first is safe: a user
-  // who sets the env var is deliberately choosing that identity for caching.
-  const apiKey = process.env.CURSOR_API_KEY;
-  if (apiKey) {
-    return crypto.createHash("sha256").update(`apikey:${apiKey}`).digest("hex");
-  }
-
-  // Pi-stored API key (from /login)
-  if (cachedAuthKey) {
-    return crypto.createHash("sha256").update(`pikey:${cachedAuthKey}`).digest("hex");
-  }
-
-  try {
-    const cliConfigPath = path.join(homeDir(), ".cursor", "cli-config.json");
-    const cliConfig = JSON.parse(fs.readFileSync(cliConfigPath, "utf8"));
-    const authInfo = cliConfig.authInfo || {};
-    const serverConfig = cliConfig.serverConfigCache || {};
-    const input = JSON.stringify(authInfo) + "|" + JSON.stringify(serverConfig);
-    return crypto.createHash("sha256").update(input).digest("hex");
-  } catch {
-    // No ~/.cursor/cli-config.json or parse error — use sentinel
-    return crypto.createHash("sha256").update("unauthenticated").digest("hex");
-  }
-}
-
-/**
- * Load model cache from disk.
- *
- * Reads the cache file, finds the entry for the current auth hash,
- * and returns it if valid. When allowStale is false (default), returns
- * null for expired entries (beyond TTL). When allowStale is true, returns
- * the cached entry regardless of age — useful for CLI-fallback when the
- * primary fetch fails.
- *
- * Returns null on any other failure (missing file, corrupt JSON,
- * no matching entry).
- *
- * @param {{ allowStale?: boolean }} [options]
- * @returns {{ models: Array, cachedAt: number } | null}
- */
-function loadModelCache(options = {}) {
-  if (DISABLE_MODEL_CACHE) return null;
-
-  let raw;
-  try {
-    raw = fs.readFileSync(getCacheFilePath(), "utf8");
-  } catch {
-    return null; // ENOENT or permission error — no cache
-  }
-
-  let cache;
-  try {
-    cache = JSON.parse(raw);
-  } catch {
-    // Corrupt cache file — delete it to prevent repeat errors
-    try { fs.unlinkSync(getCacheFilePath()); } catch {}
-    return null;
-  }
-
-  if (!cache || cache.formatVersion !== CACHE_FORMAT_VERSION) return null;
-
-  const authHash = getAuthHash();
-  const entry = cache.entries?.[authHash];
-  if (!entry || !Array.isArray(entry.models)) return null;
-
-  const ttl = getCacheTTL();
-  const age = Date.now() - entry.cachedAt;
-  if (!options.allowStale && age > ttl) return null;
-
-  return { models: entry.models, cachedAt: entry.cachedAt };
-}
-
-/**
- * Save model cache to disk.
- *
- * Reads existing cache, updates the entry for the current auth hash,
- * purges stale entries, and writes back. Fire-and-forget — caller
- * should not await.
- *
- * @param {Array<{ id: string, name?: string, object?: string, owned_by?: string }>} models
- * @param {string} [cliVersion] — cursor-agent CLI version string (for debugging)
- * @returns {Promise<void>}
- */
-async function saveModelCache(models, cliVersion) {
-  if (DISABLE_MODEL_CACHE || !Array.isArray(models) || models.length === 0) return;
-
-  const filePath = getCacheFilePath();
-  const authHash = getAuthHash();
-  const ttl = getCacheTTL();
-
-  // Read existing cache (ignore errors — we'll create from scratch)
-  let cache;
-  try {
-    cache = JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    cache = { formatVersion: CACHE_FORMAT_VERSION, entries: {} };
-  }
-
-  if (!cache.entries) cache.entries = {};
-  if (!cache.formatVersion) cache.formatVersion = CACHE_FORMAT_VERSION;
-
-  // Update entry for current auth
-  cache.entries[authHash] = {
-    cachedAt: Date.now(),
-    cliVersion: cliVersion || "",
-    models: models.map(m => ({
-      id: m.id,
-      name: m.name || m.id,
-      contextWindow: m.contextWindow ?? null,
-      maxTokens: m.maxTokens ?? null,
-      object: m.object || "model",
-      owned_by: m.owned_by || "cursor",
-    })),
-  };
-
-  // Purge entries older than 2x TTL to prevent unbounded growth
-  const cutoff = Date.now() - 2 * ttl;
-  for (const hash of Object.keys(cache.entries)) {
-    if (cache.entries[hash].cachedAt < cutoff) {
-      delete cache.entries[hash];
-    }
-  }
-
-  // Ensure directory exists
-  try {
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-  } catch {}
-
-  // Write atomically via temp file
-  const tmpPath = filePath + ".tmp";
-  try {
-    fs.writeFileSync(tmpPath, JSON.stringify(cache, null, 2), "utf8");
-    fs.renameSync(tmpPath, filePath);
-  } catch (err) {
-    try { fs.unlinkSync(tmpPath); } catch {}
-    console.error("[cursor-bridge] Failed to write model cache:", err.message);
-  }
 }
 
 // ─── Model Family Detection ─────────────────────────────────────────────
@@ -2287,7 +2097,7 @@ export default async function (pi) {
   async function getModels() {
     // Disk cache read: only on first call per extension lifecycle
     if (modelsCache.length === 0 && !DISABLE_MODEL_CACHE) {
-      const diskEntry = loadModelCache();
+      const diskEntry = loadModelCache({}, cachedAuthKey);
       if (diskEntry) {
         // cachedAt defaults to now so the in-memory 60s TTL protects this session
         adoptModels(
@@ -2305,14 +2115,14 @@ export default async function (pi) {
       adoptModels(await fetchCursorModels(cachedAuthKey), "cli");
       // Fire-and-forget: cache to disk after successful CLI fetch
       if (!DISABLE_MODEL_CACHE) {
-        saveModelCache(modelsCache).catch(() => {});
+        saveModelCache(modelsCache, undefined, cachedAuthKey).catch(() => {});
       }
     } catch (err) {
       console.error("[cursor-bridge] Failed to fetch models:", err.message);
       if (modelsCache.length === 0) {
         // Try stale disk cache before falling back to FALLBACK_MODELS
         if (!DISABLE_MODEL_CACHE) {
-          const staleEntry = loadModelCache({ allowStale: true });
+          const staleEntry = loadModelCache({ allowStale: true }, cachedAuthKey);
           if (staleEntry) {
             adoptModels(
               staleEntry.models.map(m => ({ ...m, created: Math.floor(Date.now() / 1000) })),
@@ -2362,7 +2172,7 @@ export default async function (pi) {
     } catch (err) {
       // Try disk cache as fallback when peer models unavailable
       if (!DISABLE_MODEL_CACHE) {
-        const diskEntry = loadModelCache({ allowStale: true });
+        const diskEntry = loadModelCache({ allowStale: true }, cachedAuthKey);
         if (diskEntry) {
           const models = diskEntry.models.map(m => ({
             ...m,
