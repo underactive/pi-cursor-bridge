@@ -35,13 +35,15 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 // bindings are populated by loadSdkHelpers() before any request is served.
 let collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens, rebaseSdkUsageFields;
 let enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHints, normalizeBridgeToolArgs, isBridgeToolAbortResult;
+let parseModelId, buildModelFamilies, resolveModelVariant, stripContextSuffix, extractContextSuffix;
 
 async function loadSdkHelpers() {
   const selfReal = fs.realpathSync(fileURLToPath(import.meta.url));
   const helpersPath = path.join(path.dirname(selfReal), "..", "lib", "cursor-helpers.js");
   const helpers = await import(pathToFileURL(helpersPath).href);
   ({ collectSdkImages, isSdkRejection, makeSdkDeferred, sanitizeSdkError, estimateConversationTokens, rebaseSdkUsageFields,
-    enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHints, normalizeBridgeToolArgs, isBridgeToolAbortResult } = helpers);
+    enhanceBridgeInputSchema, enhanceBridgeToolDescription, bridgeToolSteeringHints, normalizeBridgeToolArgs, isBridgeToolAbortResult,
+    parseModelId, buildModelFamilies, resolveModelVariant, stripContextSuffix, extractContextSuffix } = helpers);
 }
 
 // ─── Session Management ──────────────────────────────────────────────────────
@@ -213,13 +215,20 @@ function forceMode() {
 }
 
 /**
+ * Resolve the user's home directory (with a /tmp fallback for bare envs).
+ */
+function homeDir() {
+  return process.env.HOME || process.env.USERPROFILE || "/tmp";
+}
+
+/**
  * Resolve the cursor-agent binary path.
  */
 function resolveCursorAgent() {
   const envPath = process.env.PI_CURSOR_AGENT_PATH;
   if (envPath && fs.existsSync(envPath)) return envPath;
 
-  const home = process.env.HOME || process.env.USERPROFILE || "/tmp";
+  const home = homeDir();
   const candidates = [
     path.join(home, ".local", "bin", "cursor-agent"),
     path.join(home, ".cursor", "bin", "cursor-agent"),
@@ -234,6 +243,16 @@ function resolveCursorAgent() {
 
 function cursorAgentPath() {
   return process.env.PI_CURSOR_AGENT_PATH || resolveCursorAgent();
+}
+
+/**
+ * Environment for cursor-agent spawns: inherits the process env and injects
+ * the Pi-stored API key when one is cached.
+ */
+function cursorAgentEnv() {
+  return cachedAuthKey
+    ? { ...process.env, CURSOR_API_KEY: cachedAuthKey }
+    : { ...process.env };
 }
 
 // ─── Cache Infrastructure ────────────────────────────────────────────────
@@ -275,8 +294,7 @@ let cachedAuthKey = null;
  */
 function extractAuthKey() {
   try {
-    const home = process.env.HOME || process.env.USERPROFILE || "/tmp";
-    const authPath = path.join(home, ".pi", "agent", "auth.json");
+    const authPath = path.join(homeDir(), ".pi", "agent", "auth.json");
     const data = JSON.parse(fs.readFileSync(authPath, "utf8"));
     const entry = data[PROVIDER_ID];
     if (entry && entry.type === "api_key" && entry.key) {
@@ -306,8 +324,7 @@ function getCacheTTL() {
  * Resolve the cache file path: ~/.pi/agent/cursor-bridge-model-cache.json
  */
 function getCacheFilePath() {
-  const home = process.env.HOME || process.env.USERPROFILE || "/tmp";
-  return path.join(home, ".pi", "agent", "cursor-bridge-model-cache.json");
+  return path.join(homeDir(), ".pi", "agent", "cursor-bridge-model-cache.json");
 }
 
 /**
@@ -340,11 +357,7 @@ function getAuthHash() {
   }
 
   try {
-    const cliConfigPath = path.join(
-      process.env.HOME || process.env.USERPROFILE || "/tmp",
-      ".cursor",
-      "cli-config.json"
-    );
+    const cliConfigPath = path.join(homeDir(), ".cursor", "cli-config.json");
     const cliConfig = JSON.parse(fs.readFileSync(cliConfigPath, "utf8"));
     const authInfo = cliConfig.authInfo || {};
     const serverConfig = cliConfig.serverConfigCache || {};
@@ -514,9 +527,7 @@ async function fetchCursorModels() {
     const child = spawn(cursorAgentPath(), ["models", "--trust"], {
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32",
-      env: cachedAuthKey
-        ? { ...process.env, CURSOR_API_KEY: cachedAuthKey }
-        : { ...process.env },
+      env: cursorAgentEnv(),
     });
     let stdout = "";
     let stderr = "";
@@ -590,201 +601,8 @@ function normalizeModel(modelId) {
 
 // ─── Model Family Detection ─────────────────────────────────────────────
 
-/**
- * Known effort level tokens, ordered longest-first for greedy matching.
- * These appear as suffixes in cursor-agent model IDs.
- */
-const EFFORT_TOKENS = ["extra-high", "xhigh", "medium", "high", "low", "none", "max"];
-
-/**
- * Suffix string appended to an effort-tier model to indicate a thinking variant,
- * e.g. `claude-4.6-sonnet-medium-thinking`.
- */
-const THINKING_SUFFIX = "-thinking";
-
-/**
- * Parse a raw cursor-agent model ID into its constituent parts.
- *
- * Returns `null` for models that cannot be parsed (no effort token detected),
- * UNLESS the model is a boolean-thinking variant (e.g. `claude-4.5-sonnet-thinking`)
- * where the `-thinking` suffix alone signals the thinking variant.
- *
- * @param {string} modelId — raw model ID from cursor-agent (e.g. "gpt-5.5-high")
- * @returns {{ base: string, effort: string|null, isThinking: boolean, isFast: boolean, originalModelId: string } | null}
- */
-function parseModelId(modelId) {
-  if (!modelId || modelId === "auto") return null;
-
-  // 0. Strip @ context suffix (Pi model ID convention, before any parsing)
-  let id = modelId;
-  const contextSuffix = extractContextSuffix(id);
-  if (contextSuffix) {
-    id = stripContextSuffix(id);
-  }
-
-  // 1. Strip -fast suffix (orthogonal speed modifier, deferred)
-  let isFast = false;
-  if (id.endsWith("-fast")) {
-    id = id.slice(0, -5);
-    isFast = true;
-  }
-
-  // 2. Detect -thinking suffix (thinking variant appended to an effort tier)
-  let hasThinkingSuffix = false;
-  if (id.endsWith(THINKING_SUFFIX)) {
-    hasThinkingSuffix = true;
-    id = id.slice(0, -THINKING_SUFFIX.length);
-  }
-
-  // 3. Try to match an effort token from the right
-  for (const token of EFFORT_TOKENS) {
-    const suffix = `-${token}`;
-    if (id.endsWith(suffix)) {
-      const base = id.slice(0, -suffix.length);
-      if (!base) continue;
-
-      // 4. Detect thinking infix/suffix in the base.
-      //    -thinking- (with trailing dash): e.g. "claude-opus-4-7-thinking-high"
-      //    -thinking at end: effort was stripped after thinking infix
-      let baseName = base;
-      let isThinkingInfix = false;
-
-      const thinkingInfixPattern = "-thinking-";
-      const tiIdx = base.lastIndexOf(thinkingInfixPattern);
-      if (tiIdx !== -1) {
-        baseName = base.slice(0, tiIdx);
-        isThinkingInfix = true;
-      } else {
-        const thinkingSuffixOnBase = "-thinking";
-        if (base.endsWith(thinkingSuffixOnBase) && base.length > thinkingSuffixOnBase.length) {
-          const tsIdx = base.lastIndexOf(thinkingSuffixOnBase);
-          const beforeThinking = base.slice(0, tsIdx);
-          if (beforeThinking && beforeThinking.length > 0 && beforeThinking.includes("-")) {
-            baseName = beforeThinking;
-            isThinkingInfix = true;
-          }
-        }
-      }
-
-      const family = isThinkingInfix ? `${baseName}-thinking` : baseName;
-
-      return {
-        base: family,
-        effort: token,
-        isThinking: isThinkingInfix || hasThinkingSuffix,
-        originalModelId: modelId,
-        isFast,
-      };
-    }
-  }
-
-  // 5. Boolean-thinking model: -thinking suffix, no effort token
-  //    e.g. "claude-4.5-sonnet-thinking"
-  if (hasThinkingSuffix && id) {
-    if (id.indexOf("-") !== -1 || /^[a-z]/.test(id)) {
-      return {
-        base: id,
-        effort: null,
-        isThinking: true,
-        originalModelId: modelId,
-        isFast,
-      };
-    }
-  }
-
-  // No effort token found — standalone model
-  return null;
-}
-
-/**
- * Group raw cursor-agent model objects into families and build the variant map.
- *
- * @param {Array<{ id: string }>} models — raw model objects from fetchCursorModels()
- * @returns {{ families: Map<string, object>, variantMap: object, standaloneModels: string[] }}
- */
-function buildModelFamilies(models) {
-  const families = new Map();
-  const variantMap = {};
-  const standaloneSet = new Set();
-  let standaloneModels = [];
-
-  // Phase 1: Parse each model and group into families
-  for (const m of models) {
-    if (!m.id || m.id.startsWith("_")) continue;
-    const parsed = parseModelId(m.id);
-    if (!parsed) { standaloneSet.add(m.id); continue; }
-
-    const { base, effort, isThinking, originalModelId } = parsed;
-
-    if (!families.has(base)) {
-      families.set(base, {
-        variants: {},
-        thinkingVariants: {},
-        booleanThinkingVariant: null,
-        hasNonThinking: false,
-      });
-    }
-
-    const family = families.get(base);
-    if (isThinking && effort === null) {
-      family.booleanThinkingVariant = originalModelId;
-    } else if (isThinking) {
-      family.thinkingVariants[effort] = originalModelId;
-    } else {
-      family.variants[effort] = originalModelId;
-      family.hasNonThinking = true;
-    }
-  }
-
-  // Phase 2: Build variantMap from families
-  for (const [base, family] of families) {
-    const entry = { variants: {}, thinkingVariants: {}, defaultVariant: null };
-    Object.assign(entry.variants, family.variants);
-    Object.assign(entry.thinkingVariants, family.thinkingVariants);
-
-    if (family.booleanThinkingVariant) {
-      entry.thinkingVariants.on = family.booleanThinkingVariant;
-    }
-
-    const vKeys = Object.keys(entry.variants);
-    const tKeys = Object.keys(entry.thinkingVariants);
-
-    if (entry.variants.medium) entry.defaultVariant = entry.variants.medium;
-    else if (entry.variants.high) entry.defaultVariant = entry.variants.high;
-    else if (vKeys.length > 0) entry.defaultVariant = entry.variants[vKeys[0]];
-    else if (tKeys.length > 0) entry.defaultVariant = entry.thinkingVariants[tKeys[0]];
-
-    if (vKeys.length > 0 || tKeys.length > 0) {
-      variantMap[base] = entry;
-    } else {
-      standaloneSet.add(base);
-    }
-  }
-
-  // Phase 3: Link standalone models that match family base names
-  //          and resolve boolean-thinking linking.
-  standaloneModels = [...standaloneSet];
-  for (const [base, family] of families) {
-    const entry = variantMap[base];
-    if (!entry) continue;
-
-    // If a standalone model shares the base name, link it into the family
-    const ntIdx = standaloneModels.indexOf(base);
-    if (ntIdx !== -1) {
-      entry.variants.off = base;
-      entry.defaultVariant = base;
-      standaloneModels.splice(ntIdx, 1);
-    }
-
-    // Boolean-thinking models with no standalone base get custom linking
-    if (family.booleanThinkingVariant && family.hasNonThinking === false && !entry.variants.off) {
-      // No stand-alone base model — the thinking variant is the only member.
-      // Keep the current default (thinking variant) but flag it as "on" only.
-    }
-  }
-
-  return { families, variantMap, standaloneModels };
-}
+// parseModelId, buildModelFamilies, and resolveModelVariant now live in
+// ../lib/cursor-helpers.js (pure, unit-tested) and are bound by loadSdkHelpers().
 
 /**
  * Determine if a model has a family that supports reasoning.
@@ -796,37 +614,6 @@ function supportsReasoning(modelId, familyData) {
     return Object.keys(entry.variants).length >= 1 || Object.keys(entry.thinkingVariants).length >= 1;
   }
   return false;
-}
-
-/**
- * Resolve the effective cursor-agent model ID given a collapsed family ID
- * and an optional reasoning_effort value from the request body.
- *
- * @param {string} familyId — collapsed base model ID (without variant suffix)
- * @param {string|undefined} reasoningEffort — reasoning_effort from request body
- * @param {object} variantMap — from buildModelFamilies()
- * @returns {string|null} — resolved model ID, or null if no match
- */
-function resolveModelVariant(familyId, reasoningEffort, variantMap) {
-  const entry = variantMap[familyId];
-  if (!entry) return null;
-
-  // No reasoning_effort or "off": use default non-thinking variant
-  if (!reasoningEffort || reasoningEffort === "off") {
-    return entry.defaultVariant || null;
-  }
-
-  // reasoning_effort present and not "off": try thinking variant first
-  if (entry.thinkingVariants[reasoningEffort]) {
-    return entry.thinkingVariants[reasoningEffort];
-  }
-
-  // Fall back to non-thinking variant at this effort
-  if (entry.variants[reasoningEffort]) {
-    return entry.variants[reasoningEffort];
-  }
-
-  return null;
 }
 
 /**
@@ -934,9 +721,7 @@ function handleChatCompletions(req, res) {
     const child = spawn(cursorAgentPath(), args, {
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32",
-      env: cachedAuthKey
-        ? { ...process.env, CURSOR_API_KEY: cachedAuthKey }
-        : { ...process.env },
+      env: cursorAgentEnv(),
     });
 
     if (session) {
@@ -2417,7 +2202,7 @@ function applySdkUsage(partial, usage, estimate) {
       if (block.type === "text") outChars += block.text.length;
       else if (block.type === "thinking") outChars += block.thinking.length;
     }
-    outputTokens = estimateSdkTokens(" ".repeat(outChars));
+    outputTokens = Math.max(0, Math.ceil(outChars / SDK_APPROX_CHARS_PER_TOKEN));
   }
   const fields = rebaseSdkUsageFields(outputTokens, estimate);
   partial.usage.input = fields.input;
@@ -2476,8 +2261,13 @@ function isSdkAbort(error) {
 
 // ─── Provider registration ────────────────────────────────────────────────────
 
-function registerCursorProvider(pi, modelConfigs) {
-  pi.registerProvider(PROVIDER_ID, {
+/**
+ * Shared provider config for both backends. The SDK variant overrides `api`
+ * and adds `streamSimple`; there baseUrl/apiKey are inert placeholders (Pi
+ * requires them even for a custom streamSimple provider).
+ */
+function baseProviderConfig(modelConfigs) {
+  return {
     name: "Cursor Bridge",
     baseUrl: `http://${HOST}:${PORT}/v1`,
     apiKey: "$PI_CURSOR_AGENT_API_KEY",
@@ -2490,7 +2280,11 @@ function registerCursorProvider(pi, modelConfigs) {
       maxTokensField: "max_tokens",
       supportsUsageInStreaming: true,
     },
-  });
+  };
+}
+
+function registerCursorProvider(pi, modelConfigs) {
+  pi.registerProvider(PROVIDER_ID, baseProviderConfig(modelConfigs));
 }
 
 /**
@@ -2528,19 +2322,9 @@ const STRIP_SYSTEM_PROMPT = process.env.PI_CURSOR_STRIP_SYSTEM_PROMPT !== "0";
  */
 function registerCursorSdkProvider(pi, modelConfigs) {
   pi.registerProvider(PROVIDER_ID, {
-    name: "Cursor Bridge",
-    baseUrl: `http://${HOST}:${PORT}/v1`, // inert: SDK path bypasses HTTP
-    apiKey: "$PI_CURSOR_AGENT_API_KEY",
+    ...baseProviderConfig(modelConfigs), // baseUrl/apiKey inert: SDK path bypasses HTTP
     api: CURSOR_SDK_API,
-    authHeader: false,
     streamSimple: streamCursorSdk,
-    models: modelConfigs,
-    compat: {
-      supportsDeveloperRole: true,
-      supportsReasoningEffort: true,
-      maxTokensField: "max_tokens",
-      supportsUsageInStreaming: true,
-    },
   });
 }
 
@@ -2584,11 +2368,16 @@ function getSdkVersion() {
   return null;
 }
 
-/** Render the current status as display lines (used by command + startup log). */
-function getCursorStatusLines() {
-  const authSource = cachedAuthKey
+/** Human-readable auth-source label shared by /cursor-status and the startup log. */
+function resolveAuthSourceLabel() {
+  return cachedAuthKey
     ? "Pi AuthStorage (cursor-bridge)"
     : (process.env.CURSOR_API_KEY ? "CURSOR_API_KEY env" : "none");
+}
+
+/** Render the current status as display lines (used by command + startup log). */
+function getCursorStatusLines() {
+  const authSource = resolveAuthSourceLabel();
   const sdkVersion = getSdkVersion();
   const rg = process.env.CURSOR_RIPGREP_PATH;
   return [
@@ -2607,9 +2396,7 @@ function getCursorStatusLines() {
 
 /** Compact backend summary for the one-time startup log. */
 function buildStartupLogLines() {
-  const authSource = cachedAuthKey
-    ? "Pi AuthStorage (cursor-bridge)"
-    : (process.env.CURSOR_API_KEY ? "CURSOR_API_KEY env" : "none");
+  const authSource = resolveAuthSourceLabel();
   const sdkVersion = getSdkVersion();
   const lines = [
     `Backend: ${cursorStatus.backend} (${cursorStatus.modelCount} models${cursorStatus.modelSource ? `, ${cursorStatus.modelSource}` : ""})`,
@@ -2800,20 +2587,35 @@ export default async function (pi) {
   // Read stored API key from Pi's AuthStorage at startup
   extractAuthKey();
 
+  /**
+   * Adopt a model list as the active set: update the in-memory cache, rebuild
+   * the variant map and per-model context windows, and record the cache
+   * timestamp + origin.
+   *
+   * @param {Array} models — model objects to adopt
+   * @param {string} origin — "disk" | "cli" | "stale-disk" | "fallback"
+   * @param {number} [cachedAt] — cache timestamp; defaults to now. Pass 0 to
+   *   leave the in-memory TTL expired (fallback adoption retries the CLI).
+   */
+  function adoptModels(models, origin, cachedAt) {
+    modelsCache = models;
+    const { variantMap: vm } = buildModelFamilies(modelsCache);
+    globalThis.__variantMap = vm;
+    globalThis.__modelContextWindows = buildModelContextWindows(modelsCache);
+    modelsCacheTime = cachedAt ?? Date.now();
+    modelsCacheOrigin = origin;
+  }
+
   async function getModels() {
     // Disk cache read: only on first call per extension lifecycle
     if (modelsCache.length === 0 && !DISABLE_MODEL_CACHE) {
       const diskEntry = loadModelCache();
       if (diskEntry) {
-        modelsCache = diskEntry.models.map(m => ({
-          ...m,
-          created: Math.floor(Date.now() / 1000),
-        }));
-        const { variantMap: vm } = buildModelFamilies(modelsCache);
-        globalThis.__variantMap = vm;
-        globalThis.__modelContextWindows = buildModelContextWindows(modelsCache);
-        modelsCacheTime = Date.now(); // reset so in-memory 60s TTL protects this session
-        modelsCacheOrigin = "disk";
+        // cachedAt defaults to now so the in-memory 60s TTL protects this session
+        adoptModels(
+          diskEntry.models.map(m => ({ ...m, created: Math.floor(Date.now() / 1000) })),
+          "disk",
+        );
         return modelsCache;
       }
     }
@@ -2822,14 +2624,9 @@ export default async function (pi) {
       return modelsCache;
     }
     try {
-      modelsCache = await fetchCursorModels();
-      const { variantMap: vm } = buildModelFamilies(modelsCache);
-      globalThis.__variantMap = vm;
-      globalThis.__modelContextWindows = buildModelContextWindows(modelsCache);
-      modelsCacheTime = Date.now();
+      adoptModels(await fetchCursorModels(), "cli");
       // Fire-and-forget: cache to disk after successful CLI fetch
       if (!DISABLE_MODEL_CACHE) {
-        modelsCacheOrigin = "cli";
         saveModelCache(modelsCache).catch(() => {});
       }
     } catch (err) {
@@ -2839,15 +2636,11 @@ export default async function (pi) {
         if (!DISABLE_MODEL_CACHE) {
           const staleEntry = loadModelCache({ allowStale: true });
           if (staleEntry) {
-            modelsCache = staleEntry.models.map(m => ({
-              ...m,
-              created: Math.floor(Date.now() / 1000),
-            }));
-            const { variantMap: vm } = buildModelFamilies(modelsCache);
-            globalThis.__variantMap = vm;
-            globalThis.__modelContextWindows = buildModelContextWindows(modelsCache);
-            modelsCacheTime = staleEntry.cachedAt;
-            modelsCacheOrigin = "stale-disk";
+            adoptModels(
+              staleEntry.models.map(m => ({ ...m, created: Math.floor(Date.now() / 1000) })),
+              "stale-disk",
+              staleEntry.cachedAt,
+            );
             return modelsCache;
           }
         }
@@ -2857,11 +2650,8 @@ export default async function (pi) {
           created: Math.floor(Date.now() / 1000),
           owned_by: "cursor",
         }));
-        modelsCache = fallback;
-        const { variantMap: vm } = buildModelFamilies(fallback);
-        globalThis.__variantMap = vm;
-        globalThis.__modelContextWindows = buildModelContextWindows(fallback);
-        modelsCacheOrigin = "fallback";
+        // cachedAt 0 keeps the in-memory TTL expired so the next call retries the CLI
+        adoptModels(fallback, "fallback", 0);
       }
     }
     return modelsCache;
@@ -3090,7 +2880,6 @@ const MAX_TOKENS_MAP = Object.fromEntries(
  */
 function contextWindowToSuffix(cw) {
   if (cw >= 1_000_000) return "1m";
-  if (cw >= 500_000) return `${Math.round(cw / 1000)}k`;
   return `${Math.round(cw / 1000)}k`;
 }
 
@@ -3107,27 +2896,6 @@ function parseContextWindow(suffix) {
   const num = parseInt(m[1], 10);
   const unit = m[2].toLowerCase();
   return unit === "m" ? num * 1_000_000 : num * 1_000;
-}
-
-/**
- * Strip @ context suffix from a model ID.
- * @param {string} modelId
- * @returns {string}
- */
-function stripContextSuffix(modelId) {
-  if (!modelId) return modelId;
-  return modelId.replace(/@[a-z0-9]+$/, "");
-}
-
-/**
- * Extract the @ context suffix from a model ID.
- * @param {string} modelId
- * @returns {string|null} e.g. "@1m", "@272k", or null
- */
-function extractContextSuffix(modelId) {
-  if (!modelId) return null;
-  const m = modelId.match(/@[a-z0-9]+$/);
-  return m ? m[0] : null;
 }
 
 // ─── Model context window cache builder ─────────────────────────────────────
@@ -3165,22 +2933,29 @@ function buildModelContextWindows(models) {
  * Ensures every fallback model ID has an accurate context window even
  * when the live cursor-agent models fetch fails.
  */
-const FALLBACK_MODEL_CONTEXT_WINDOWS = Object.fromEntries(
-  FALLBACK_MODELS.map(id => {
-    const parsed = parseModelId(id);
-    const key = parsed ? parsed.base : id;
-    return [id, MODEL_CONTEXT_WINDOWS[key] ?? FALLBACK_CONTEXT_WINDOW];
-  })
-);
+// Lazy (function, not module-scope const): parseModelId is bound by
+// loadSdkHelpers() after module evaluation, so this must not run at import time.
+function buildFallbackModelContextWindows() {
+  return Object.fromEntries(
+    FALLBACK_MODELS.map(id => {
+      const parsed = parseModelId(id);
+      const key = parsed ? parsed.base : id;
+      return [id, MODEL_CONTEXT_WINDOWS[key] ?? FALLBACK_CONTEXT_WINDOW];
+    })
+  );
+}
 
 /**
- * Fallback max tokens map: mirrors FALLBACK_MODEL_CONTEXT_WINDOWS keys.
- * Ensures every fallback model ID has a max tokens value.
+ * Fallback max tokens map: mirrors buildFallbackModelContextWindows() keys.
+ * Ensures every fallback model ID has a max tokens value. Lazy for the same
+ * reason as buildFallbackModelContextWindows.
  */
-const FALLBACK_MAX_TOKENS_MAP = Object.fromEntries(
-  Object.keys(FALLBACK_MODEL_CONTEXT_WINDOWS).map(id => {
-    const parsed = parseModelId(id);
-    const key = parsed ? parsed.base : id;
-    return [id, MAX_TOKENS_MAP[key] ?? DEFAULT_MAX_TOKENS];
-  })
-);
+function buildFallbackMaxTokensMap() {
+  return Object.fromEntries(
+    Object.keys(buildFallbackModelContextWindows()).map(id => {
+      const parsed = parseModelId(id);
+      const key = parsed ? parsed.base : id;
+      return [id, MAX_TOKENS_MAP[key] ?? DEFAULT_MAX_TOKENS];
+    })
+  );
+}
