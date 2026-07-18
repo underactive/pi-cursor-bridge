@@ -4,9 +4,19 @@
 
 This repository is a publishable Pi extension package:
 
-- `extensions/cursor-bridge.js` — main extension: SDK backend (preferred), CLI/proxy fallback, local HTTP server on `127.0.0.1:32124`, model discovery/caching, Pi provider registration, and `/cursor-status` / `/cursor-refresh-models` commands.
-- `lib/cursor-helpers.js` — pure, dependency-free helpers for SDK image collection, error sanitization, and rejection detection. Lives outside `extensions/` so Pi does not auto-discover it as a separate extension.
-- `test/*.test.js` — unit tests for `lib/cursor-helpers.js` (run via `npm test` / `node --test`).
+- `extensions/cursor-bridge.js` — main extension wiring: `@cursor/sdk` backend (preferred), tool bridge, TUI rendering, Pi provider registration, the `createModelService` factory, startup sequencing, and the `/cursor-status` / `/cursor-refresh-models` commands. Loads every `lib/` module at startup through `loadSdkHelpers()` / `importLib()` — a realpath-based dynamic import that survives Pi's symlinked extension loading (a static `import "../lib/..."` would break).
+- `lib/cursor-helpers.js` — pure, dependency-free helpers for SDK image collection, error sanitization, rejection detection, and model-family parsing (`parseModelId`, `buildModelFamilies`, `resolveModelVariant`).
+- `lib/sessions.js` — `CursorSession` / `SessionManager` (X-Session-Id lifecycle, idle timeouts, subprocess cleanup).
+- `lib/cursor-cli.js` — cursor-agent binary resolution, spawn env (`cursorAgentEnv(authKey)`), model listing, prompt building, error formatting.
+- `lib/model-data.js` — static model data: fallback list, context-window/max-tokens maps, vision capability set, context-suffix helpers.
+- `lib/model-cache.js` — on-disk model cache keyed by auth hash (the Pi-stored key is threaded in as a parameter; the extension owns the mutable `cachedAuthKey`).
+- `lib/model-catalog.js` — `ModelCatalog`, the family variant map (replaces the old `globalThis.__variantMap`). `adopt()`/`clear()` replace — never mutate — the map so in-flight requests keep a consistent snapshot (L5).
+- `lib/proxy.js` — the OpenAI-compatible HTTP proxy: `/v1/chat/completions` handler (streaming + non-streaming), peer discovery, and `startProxyServer` with injected deps (`catalog`, `getAuthKey`, `getLiveRunsCount`, …).
+
+All `lib/` modules are pure Node (no Pi imports) and live outside `extensions/` so Pi does not auto-discover them as separate extensions. `lib`→`lib` static imports are fine; only the extension must use the dynamic `importLib()` path.
+
+- `test/*.test.js` — unit + smoke tests for the `lib/` modules (run via `npm test`, which targets `test/*.test.js`).
+- `test/fixtures/fake-cursor-agent.mjs` — executable fake cursor-agent used by `test/proxy.test.js` to smoke-test both streaming and non-streaming completion paths end-to-end (`PI_CURSOR_AGENT_PATH` points at it; the server listens on an ephemeral port). It must NOT be picked up as a test file — keep the npm test glob scoped to `test/*.test.js`.
 - `package.json` — declares `pi.extensions: ["./extensions"]` so Pi auto-discovers the module when installed via npm. Lists `@cursor/sdk` as an optional dependency.
 - `LICENSE` — MIT.
 - `README.md` / `AGENTS.md` — user docs and contributor notes.
