@@ -20,10 +20,13 @@ test("forceMode() reads PI_CURSOR_FORCE_MODE per run and accepts only plan/ask",
 	assert.match(cliSource, /v === "plan" \|\| v === "ask" \? v : null/);
 });
 
+// The CLI completion spawn lives in lib/proxy.js.
+const proxySource = readFileSync(path.join(root, "lib", "proxy.js"), "utf8");
+
 test("CLI path: --mode replaces --force when forceMode() is set", () => {
-	assert.match(source, /if \(cliForceMode\) args\.push\("--mode", cliForceMode\);\s*\n\s*else args\.push\("--force"\);/);
+	assert.match(proxySource, /if \(cliForceMode\) args\.push\("--mode", cliForceMode\);\s*\n\s*else args\.push\("--force"\);/);
 	// --force must never be an unconditional completion-spawn arg.
-	assert.doesNotMatch(source, /"--model", effectiveModel, "--trust", "--force"/);
+	assert.doesNotMatch(proxySource, /"--model", effectiveModel, "--trust", "--force"/);
 });
 
 test("SDK path: Agent.create uses plan mode when forceMode() is set", () => {

@@ -40,6 +40,7 @@ let parseModelId, buildModelFamilies, resolveModelVariant, stripContextSuffix, e
 let CursorSession, SessionManager, getSessionTimeout, DEFAULT_SESSION_TIMEOUT_MS;
 let DISABLE_MODEL_CACHE, getCacheTTL, getCacheFilePath, getAuthHash, loadModelCache, saveModelCache;
 let ModelCatalog;
+let handleChatCompletions, fetchLocalJson, detectExistingProxy, startProxyServer;
 let forceMode, homeDir, resolveCursorAgent, cursorAgentPath, cursorAgentEnv, fetchCursorModels,
   buildPromptFromMessages, normalizeModel, formatCursorError;
 let FALLBACK_MODELS, FALLBACK_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, VISION_CAPABLE_SDK_MODELS,
@@ -73,6 +74,8 @@ async function loadSdkHelpers() {
   ({ DISABLE_MODEL_CACHE, getCacheTTL, getCacheFilePath, getAuthHash, loadModelCache, saveModelCache } = await importLib("model-cache.js"));
 
   ({ ModelCatalog } = await importLib("model-catalog.js"));
+
+  ({ handleChatCompletions, fetchLocalJson, detectExistingProxy, startProxyServer } = await importLib("proxy.js"));
 }
 
 /**
@@ -89,8 +92,6 @@ const PORT = 32124;
 const HOST = "127.0.0.1";
 const PROVIDER_ID = "cursor-bridge";
 const HEALTH_SERVICE_ID = "cursor-bridge";
-// L3: cap the buffered stdout of a non-streaming cursor-agent reply (16 MiB).
-const MAX_NONSTREAM_STDOUT_BYTES = 16 * 1024 * 1024;
 
 // ─── Cache Infrastructure ────────────────────────────────────────────────
 
@@ -134,461 +135,6 @@ function extractAuthKey() {
 
 // parseModelId, buildModelFamilies, and resolveModelVariant now live in
 // ../lib/cursor-helpers.js (pure, unit-tested) and are bound by loadSdkHelpers().
-
-// ─── Chat completions handler ─────────────────────────────────────────
-
-/**
- * Module-level session manager instance, set when the proxy server starts.
- * The handler reads the X-Session-Id header to route requests to the
- * appropriate session for multi-turn conversations.
- * @type {SessionManager|null}
- */
-let activeSessionManager = null;
-
-function handleChatCompletions(req, res) {
-  let body = "";
-  req.on("data", (c) => (body += c.toString()));
-  req.on("end", () => {
-    let requestBody;
-    try {
-      requestBody = JSON.parse(body);
-    } catch {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Invalid JSON body" }));
-      return;
-    }
-
-    const { messages, stream, model, reasoning_effort } = requestBody;
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "messages is required" }));
-      return;
-    }
-
-    // Session routing: optional X-Session-Id header enables multi-turn
-    const sessionId = req.headers["x-session-id"] || "";
-
-    let cursorModel = normalizeModel(model);
-
-    // Always attempt model ID resolution for collapsed families.
-    // cursor-agent only knows specific variant IDs (e.g. "gpt-5.5-high"),
-    // not family base names (e.g. "gpt-5.5"). resolveModelVariant handles
-    // both with and without reasoning_effort — when absent, it returns
-    // the default variant.
-    // L5: snapshot the variant map once. /cursor-refresh-models replaces the
-    // catalog's map mid-flight; capturing a stable reference here keeps this
-    // request reading one consistent map instead of a half-cleared one.
-    const variantMap = modelCatalog ? modelCatalog.variantMap : null;
-    if (variantMap) {
-      const resolved = resolveModelVariant(cursorModel, reasoning_effort, variantMap);
-      if (resolved) {
-        cursorModel = resolved;
-      }
-    }
-
-    // Resolve or create session. For sessionless requests, cursorModel is
-    // re-resolved each time and no subprocess is persisted.
-    const session = activeSessionManager
-      ? activeSessionManager.getOrCreateSession(sessionId, cursorModel)
-      : null;
-
-    // Model is pinned at session creation (getOrCreateSession sets modelId and
-    // never overwrites it on reuse), so subsequent turns reuse the first turn's
-    // resolved id for cross-turn consistency.
-    const effectiveModel = (session && session.modelId) ? session.modelId : cursorModel;
-
-    const id = `cursor-bridge-${Date.now()}`;
-    const created = Math.floor(Date.now() / 1000);
-
-    // Always spawn a fresh subprocess per request. cursor-agent reads stdin
-    // until EOF, so we must close stdin after writing the prompt to signal
-    // that input is complete. The subprocess exits after processing.
-    const args = [
-      "--output-format", "stream-json",
-      "--model", effectiveModel, "--trust",
-    ];
-    // Read-only override: in plan/ask mode the CLI itself refuses edits, and
-    // --force (auto-approve every tool) must not be passed. Otherwise keep the
-    // historical headless default of auto-approved tools.
-    const cliForceMode = forceMode();
-    if (cliForceMode) args.push("--mode", cliForceMode);
-    else args.push("--force");
-    if (stream) {
-      args.push("--stream-partial-output");
-    }
-
-    const child = spawn(cursorAgentPath(), args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      shell: process.platform === "win32",
-      env: cursorAgentEnv(cachedAuthKey),
-    });
-
-    if (session) {
-      session.subprocessRef = child;
-    }
-
-    // Build prompt from the request body messages (OpenAI API convention sends
-    // the full conversation history on every request).
-    const prompt = buildPromptFromMessages(messages);
-    child.stdin.write(prompt);
-    child.stdin.end();
-
-    if (stream) {
-      // ── Streaming ──
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      });
-
-      // M2: if the client drops the connection mid-stream, kill the subprocess
-      // instead of leaking it until the idle timer. writableFinished distinguishes
-      // the normal-completion close (res.end already ran) from a real disconnect.
-      res.on("close", () => {
-        if (res.writableFinished) return;
-        if (child && !child.killed) {
-          child.kill();
-          console.log("[cursor-bridge] child killed on client close");
-        }
-      });
-
-      // With --stream-partial-output, assistant events are usually incremental
-      // deltas; the stream may end with one cumulative snapshot. Track assembled
-      // text so we only forward the new suffix and skip duplicate finals.
-      let assembledText = "";
-      let usage = null;
-      child.stderr.on("data", () => { /* errors surfaced via [DONE] for now */ });
-
-      const writeChunk = (content) => {
-        if (!content || res.writableEnded) return; // M2: guard post-close EPIPE
-        res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n`);
-      };
-
-      const forwardAssistantText = (text) => {
-        if (!text) return;
-        let delta;
-        if (text.startsWith(assembledText)) {
-          delta = text.slice(assembledText.length);
-          assembledText = text;
-        } else {
-          delta = text;
-          assembledText += text;
-        }
-        writeChunk(delta);
-      };
-
-      const handleStreamEvent = (event) => {
-        if (event.type === "thinking") {
-          // Forward thinking content as reasoning_content delta
-          const content = event.content || event.text || "";
-          if (content) {
-            res.write(`data: ${JSON.stringify({
-              id, object: "chat.completion.chunk", created, model: cursorModel,
-              choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }]
-            })}\n\n`);
-          }
-          return;
-        }
-
-        if (event.type === "tool_call") {
-          // Forward tool call as SSE tool_calls delta
-          const toolCallPayload = {
-            id, object: "chat.completion.chunk", created, model: cursorModel,
-            choices: [{
-              index: 0,
-              delta: {
-                tool_calls: [{
-                  index: 0,
-                  id: event.id || event.toolCallId || `call_${Date.now()}`,
-                  type: "function",
-                  function: {
-                    name: event.name || event.function?.name || "",
-                    arguments: event.arguments || event.function?.arguments || JSON.stringify(event.input || {}),
-                  },
-                }],
-              },
-              finish_reason: null,
-            }],
-          };
-          res.write(`data: ${JSON.stringify(toolCallPayload)}\n\n`);
-          return;
-        }
-
-        if (event.type === "assistant" && event.message?.content) {
-          for (const block of event.message.content) {
-            if (block.type !== "text" || !block.text) continue;
-            forwardAssistantText(block.text);
-          }
-        }
-
-        if (event.type === "result") {
-          usage = event.usage || null;
-        }
-      };
-
-      const lineBuffer = [];
-      child.stdout.on("data", (d) => {
-        const lines = (lineBuffer.join("") + d.toString()).split("\n");
-        lineBuffer.length = 0;
-
-        for (let i = 0; i < lines.length - 1; i++) {
-          const line = lines[i].trim();
-          if (!line) continue;
-          try {
-            handleStreamEvent(JSON.parse(line));
-          } catch { /* skip unparseable lines */ }
-        }
-
-        if (lines.length > 0) {
-          const last = lines[lines.length - 1];
-          if (last.trim()) lineBuffer.push(last);
-        }
-      });
-
-      child.on("close", () => {
-        // Clear subprocess ref so the next request spawns a fresh subprocess
-        if (session) { session.subprocessRef = null; }
-
-        for (const line of lineBuffer) {
-          if (!line.trim()) continue;
-          try {
-            handleStreamEvent(JSON.parse(line.trim()));
-          } catch {}
-        }
-
-        // Report THIS turn's usage. The proxy serves stateless OpenAI clients
-        // that sum per-response usage, so a cumulative total would over-count.
-        const finalUsage = usage || {};
-        // M2: the client may have disconnected — only write if the response is open.
-        if (!res.writableEnded) {
-          if (finalUsage.inputTokens !== undefined || finalUsage.outputTokens !== undefined) {
-            res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [], usage: { prompt_tokens: finalUsage.inputTokens ?? 0, completion_tokens: finalUsage.outputTokens ?? 0, total_tokens: (finalUsage.inputTokens ?? 0) + (finalUsage.outputTokens ?? 0), cache_read_tokens: finalUsage.cacheReadTokens ?? 0, cache_write_tokens: finalUsage.cacheWriteTokens ?? 0 } })}\n\n`);
-          }
-          res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
-          res.write("data: [DONE]\n\n");
-          res.end();
-        }
-
-        // Start idle timeout for session release
-        if (session && sessionId) {
-          activeSessionManager?.releaseSession(sessionId);
-        }
-      });
-
-      child.on("error", (err) => {
-        if (!res.writableEnded) {
-          res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: cursorModel, choices: [{ index: 0, delta: { content: `cursor-bridge error: ${err.message}` }, finish_reason: "error" }] })}\n\n`);
-          res.write("data: [DONE]\n\n");
-          res.end();
-        }
-      });
-
-    } else {
-      // ── Non-streaming ──
-      // M2: the whole reply is buffered until child close, so an early client
-      // drop would otherwise leak the subprocess — kill it on disconnect.
-      // writableFinished excludes the normal-completion close.
-      res.on("close", () => {
-        if (res.writableFinished) return;
-        if (child && !child.killed) {
-          child.kill();
-          console.log("[cursor-bridge] child killed on client close");
-        }
-      });
-
-      let stdout = "";
-      let stderr = "";
-      let stdoutTruncated = false;
-      // L3: bound the buffered stdout. Model output is small in practice, but an
-      // unbounded `+=` would let a pathological response grow memory without limit.
-      child.stdout.on("data", (d) => {
-        if (stdout.length >= MAX_NONSTREAM_STDOUT_BYTES) { stdoutTruncated = true; return; }
-        stdout += d.toString();
-      });
-      child.stderr.on("data", (d) => (stderr += d.toString()));
-
-      child.on("close", (code) => {
-        // Clear subprocess ref so the next request spawns a fresh subprocess
-        if (session) { session.subprocessRef = null; }
-
-        let assistantText = "";
-        let thinkingText = "";
-        let errorText = "";
-        let usage = null;
-
-        for (const line of stdout.trim().split("\n")) {
-          try {
-            const event = JSON.parse(line.trim());
-            if (event.type === "thinking") {
-              thinkingText += (event.content || event.text || "");
-            }
-            if (event.type === "assistant" && event.message?.content) {
-              for (const block of event.message.content) {
-                if (block.type === "text") assistantText = block.text;
-              }
-            }
-            if (event.type === "result") {
-              usage = event.usage || null;
-              if (event.subtype === "rate_limited") {
-                errorText = "Rate limited. Check your Cursor subscription.";
-              }
-            }
-          } catch {}
-        }
-
-        if ((code !== 0 || !assistantText) && stderr.trim()) {
-          errorText = formatCursorError(stderr.trim());
-        }
-        if (stdoutTruncated) {
-          console.log(`[cursor-bridge] non-streaming stdout truncated at ${MAX_NONSTREAM_STDOUT_BYTES} bytes`);
-        }
-
-        // Report THIS turn's usage. The proxy serves stateless OpenAI clients
-        // that sum per-response usage, so a cumulative total would over-count.
-        const finalUsage = usage || {};
-
-        const responseMessage = {
-          role: "assistant",
-          content: errorText || assistantText || "No response",
-        };
-        if (thinkingText) {
-          responseMessage.reasoning_text = thinkingText;
-        }
-
-        const responsePayload = {
-          id,
-          object: "chat.completion",
-          created,
-          model: cursorModel,
-          choices: [{ index: 0, message: responseMessage, finish_reason: errorText ? "error" : "stop" }],
-        };
-        if (finalUsage.inputTokens !== undefined || finalUsage.outputTokens !== undefined) {
-          responsePayload.usage = {
-            prompt_tokens: finalUsage.inputTokens ?? 0,
-            completion_tokens: finalUsage.outputTokens ?? 0,
-            total_tokens: (finalUsage.inputTokens ?? 0) + (finalUsage.outputTokens ?? 0),
-            cache_read_tokens: finalUsage.cacheReadTokens ?? 0,
-            cache_write_tokens: finalUsage.cacheWriteTokens ?? 0,
-          };
-        }
-        // M2: skip the response write if the client already disconnected.
-        if (!res.writableEnded) {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(responsePayload));
-        }
-
-        // Start idle timeout for session release
-        if (session && sessionId) {
-          activeSessionManager?.releaseSession(sessionId);
-        }
-      });
-
-      child.on("error", (err) => {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: `Failed to spawn cursor-agent CLI: ${err.message}`, type: "server_error" } }));
-      });
-    }
-  });
-}
-
-// ─── Peer discovery ───────────────────────────────────────────────────
-
-/**
- * GET a small JSON document from the local proxy. Resolves to the parsed
- * body, or `null` if the request fails for any reason (no server, wrong
- * service, timeout, etc.). Used to detect a sibling Pi instance that
- * already owns the proxy port so we can run in client-only mode.
- */
-function fetchLocalJson(pathname, timeoutMs = 750) {
-  return new Promise((resolve) => {
-    const req = http.request(
-      { host: HOST, port: PORT, path: pathname, method: "GET", timeout: timeoutMs },
-      (res) => {
-        if (res.statusCode !== 200) {
-          res.resume();
-          resolve(null);
-          return;
-        }
-        let body = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => (body += chunk));
-        res.on("end", () => {
-          try { resolve(JSON.parse(body)); }
-          catch { resolve(null); }
-        });
-      }
-    );
-    req.on("error", () => resolve(null));
-    req.on("timeout", () => { req.destroy(); resolve(null); });
-    req.end();
-  });
-}
-
-/**
- * Probe http://127.0.0.1:32124/health and confirm a pi-cursor-bridge proxy
- * is already running there (vs. some unrelated service squatting on
- * the port). Returns true only when the running server identifies
- * itself as cursor-bridge.
- */
-async function detectExistingProxy() {
-  const health = await fetchLocalJson("/health");
-  return !!(health && health.ok === true && health.service === HEALTH_SERVICE_ID);
-}
-
-// ─── HTTP Server ──────────────────────────────────────────────────────
-
-function startProxyServer(modelsFn) {
-  // Initialize the shared session manager for multi-turn conversations
-  activeSessionManager = new SessionManager();
-
-  const server = http.createServer(async (req, res) => {
-    try {
-      const url = new URL(req.url || "/", `http://${req.headers.host || HOST}`);
-
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-      if (req.method === "OPTIONS") {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-
-      if ((url.pathname === "/v1/models" || url.pathname === "/models") && req.method === "GET") {
-        const models = await modelsFn();
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ object: "list", data: models }));
-        return;
-      }
-
-      if ((url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions") && req.method === "POST") {
-        return handleChatCompletions(req, res);
-      }
-
-      if (url.pathname === "/health" && req.method === "GET") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        // liveRuns drives the H1/H2 diagnostics: poll until it returns to 0.
-        res.end(JSON.stringify({ ok: true, service: HEALTH_SERVICE_ID, liveRuns: cursorLiveRuns.size }));
-        return;
-      }
-
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: `Not found: ${url.pathname}` }));
-    } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
-    }
-  });
-
-  // Wrap server.close to destroy sessions before releasing the port
-  const origClose_ = server.close.bind(server);
-  server.close = (...args) => {
-    if (activeSessionManager) activeSessionManager.destroy();
-    return origClose_(...args);
-  };
-
-  return server;
-}
 
 // ─── Extension entry point ────────────────────────────────────────────
 
@@ -674,7 +220,7 @@ function scheduleStartupLog(pi) {
  * instance has already populated its cache.
  */
 async function fetchPeerModels() {
-  const payload = await fetchLocalJson("/v1/models", 2000);
+  const payload = await fetchLocalJson("/v1/models", { host: HOST, port: PORT, timeoutMs: 2000 });
   if (!payload || !Array.isArray(payload.data)) {
     throw new Error("peer /v1/models returned no data");
   }
@@ -2200,13 +1746,20 @@ export default async function (pi) {
 
   // Fast path: if another Pi instance already runs the proxy, attach to it
   // instead of trying to bind the port (which would EADDRINUSE).
-  if (await detectExistingProxy()) {
+  if (await detectExistingProxy({ host: HOST, port: PORT, serviceId: HEALTH_SERVICE_ID })) {
     await attachToExistingProxy("another Pi instance owns the port");
     return;
   }
 
   try {
-    const server = startProxyServer(getModels);
+    const server = startProxyServer({
+      modelsFn: getModels,
+      catalog: modelCatalog,
+      getAuthKey: () => cachedAuthKey,
+      host: HOST,
+      healthServiceId: HEALTH_SERVICE_ID,
+      getLiveRunsCount: () => cursorLiveRuns.size,
+    });
 
     await new Promise((resolve, reject) => {
       const onListening = () => {
@@ -2247,7 +1800,7 @@ export default async function (pi) {
     // Race: another Pi instance bound the port between our probe and
     // our listen(). Fall back to client-only mode so the user still
     // gets cursor-bridge models instead of a hard failure.
-    if (err && err.code === "EADDRINUSE" && (await detectExistingProxy())) {
+    if (err && err.code === "EADDRINUSE" && (await detectExistingProxy({ host: HOST, port: PORT, serviceId: HEALTH_SERVICE_ID }))) {
       await attachToExistingProxy("port became busy during startup");
       return;
     }
