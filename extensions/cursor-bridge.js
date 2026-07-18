@@ -1485,50 +1485,23 @@ async function tryRegisterSdkProvider(pi) {
   }
 }
 
-export default async function (pi) {
-  // Load the pure helpers (see loadSdkHelpers) before anything uses them — the
-  // unhandledRejection guard below (isSdkRejection) and all request handling.
-  // A failure here is fatal and surfaces clearly at load, rather than as a
-  // confusing "undefined is not a function" on the first request.
-  await loadSdkHelpers();
-  activePi = pi; // capture for notifyCursor (used by the bridge abort handler)
+// ─── Model service ────────────────────────────────────────────────────
 
-  // The local @cursor/sdk leaks internal async rejections during agent
-  // init/cancel (e.g. initializeIgnoreMapping's RxJS pipeline). Without a
-  // handler these can crash the host or print scary stacks. Swallow ONLY
-  // SDK-originated rejections; re-surface anything else so real bugs aren't
-  // hidden. Registered once (reload-safe) to avoid accumulating handlers.
-  if (!globalThis.__piCursorBridgeSdkRejectionGuard) {
-    globalThis.__piCursorBridgeSdkRejectionGuard = true;
-    // PROCESS-GLOBAL side effect: this listener suppresses Node's default
-    // crash-on-unhandled-rejection for the WHOLE Pi process. We keep it
-    // deliberately — crashing all of Pi over one stray cross-turn SDK leak is
-    // worse than a log — but it now only swallows rejections whose TOP stack
-    // frame is inside @cursor/sdk (isSdkRejection). Everything else is logged so
-    // real application bugs stay visible rather than being silently dropped. (M5)
-    process.on("unhandledRejection", (reason) => {
-      if (isSdkRejection(reason)) return; // benign cross-turn SDK leak
-      console.error("[cursor-bridge] unhandled rejection:", reason);
-    });
-  }
-  scheduleStartupLog(pi);
-
-  if (process.env.PI_CURSOR_AGENT_DISABLE === "1") {
-    cursorStatus.backend = "disabled";
-    cursorStatus.reason = "PI_CURSOR_AGENT_DISABLE=1";
-    cursorStatus.proxy = "disabled";
-    startupLog = { lines: ["Disabled via PI_CURSOR_AGENT_DISABLE=1"] };
-    return;
-  }
-
-  // Close any server from a previous load so /reload re-binds the port with
-  // the latest handler code instead of silently reusing the stale server.
-  const PREV = globalThis.__piCursorBridgeServer;
-  if (PREV) {
-    try { PREV.close(); } catch {}
-    globalThis.__piCursorBridgeServer = null;
-  }
-
+/**
+ * Create the model service: owns the in-memory model cache (list, timestamp,
+ * origin) and the operations that populate it — getModels (disk cache → CLI →
+ * stale disk → fallback), adoptModels, peer attach, and the
+ * /cursor-refresh-models refresh flow.
+ *
+ * A module-level factory (not nested in the default export) so the export
+ * body stays a readable straight-line startup sequence. Module-level
+ * collaborators (cursorStatus, cachedAuthKey, buildModelConfigs,
+ * registerCursorProvider, tryRegisterSdkProvider, startupLog, …) are
+ * referenced directly; only `pi` is injected.
+ *
+ * @param {object} pi — the Pi extension API
+ */
+function createModelService(pi) {
   let modelsCache = [];
   let modelsCacheTime = 0;
   let modelsCacheOrigin = null; // "disk" | "cli" | "stale-disk" | "fallback"
@@ -1536,99 +1509,6 @@ export default async function (pi) {
   // session. Distinct from the on-disk DEFAULT_CACHE_TTL_MS (24 h) — renamed so
   // the two TTLs can't be confused.
   const MODEL_REFRESH_TTL_MS = 60_000;
-  modelCatalog = new ModelCatalog(); // populated alongside models by adoptModels()
-
-  // Register /cursor-refresh-models command early so it's available on all
-  // startup paths (new proxy, peer-attach, and disabled). The handler
-  // references getModels(), buildModelConfigs(), and registerCursorProvider()
-  // which are all defined later in this closure but accessible at call time.
-  pi.registerCommand("cursor-refresh-models", {
-    description: "Refresh the Cursor model list (re-discovers via the active SDK or CLI backend)",
-    handler: async (_args, ctx) => {
-      // M3: a mid-session /login changes the stored key — re-read it (a cheap
-      // file read) so the CLI spawns and the SDK backend pick up the new key
-      // without a Pi restart.
-      extractAuthKey();
-      setCursorSdkAuthKey(cachedAuthKey);
-
-      // 1. Clear disk cache
-      try { fs.unlinkSync(getCacheFilePath()); } catch {}
-
-      // 2. Reset in-memory state
-      modelsCache = [];
-      modelsCacheTime = 0;
-      modelsCacheOrigin = null;
-      modelCatalog.clear();
-
-      // 3. Re-register. Prefer the SDK backend (re-discovers its catalog);
-      //    otherwise re-fetch from the CLI (disk cache cleared → hits CLI).
-      try {
-        const sdkResult = await tryRegisterSdkProvider(pi);
-        let count;
-        let via;
-        if (sdkResult) {
-          count = sdkResult.count;
-          via = "@cursor/sdk";
-        } else {
-          const freshModels = await getModels();
-          const modelConfigs = buildModelConfigs(freshModels);
-          registerCursorProvider(pi, modelConfigs);
-          count = modelConfigs.length;
-          via = "cursor-agent CLI";
-          cursorStatus.backend = "CLI/proxy";
-          cursorStatus.modelCount = count;
-          cursorStatus.modelSource = "cursor-agent CLI";
-        }
-
-        // L5: discovering zero models is a failure to surface, not a "success".
-        if (count === 0) {
-          const warn = `No models discovered via ${via} — check auth (/login) and connectivity, then retry.`;
-          if (ctx.hasUI) {
-            pi.sendMessage({ customType: "cursor-bridge", content: warn, display: true });
-          } else {
-            console.warn(`[cursor-bridge] ${warn}`);
-          }
-        } else if (ctx.hasUI) {
-          pi.sendMessage({
-            customType: "cursor-bridge",
-            content: `Refreshed ${count} models via ${via}`,
-            display: true,
-          });
-        } else {
-          console.log(`[cursor-bridge] Refreshed ${count} models via ${via}`);
-        }
-      } catch (err) {
-        const msg = `Failed to refresh models: ${err.message}`;
-        if (ctx.hasUI) {
-          pi.sendMessage({
-            customType: "cursor-bridge",
-            content: msg,
-            display: true,
-          });
-        } else {
-          console.error(`[cursor-bridge] ${msg}`);
-        }
-      }
-    },
-  });
-
-  // Report the active backend (SDK vs CLI/proxy), why, model source, auth,
-  // proxy, runtime, and in-flight tool-bridge runs. Backend selection is
-  // otherwise silent, so this is the go-to diagnostic.
-  pi.registerCommand("cursor-status", {
-    description: "Show Cursor backend status (SDK vs CLI, models, auth, proxy)",
-    handler: async (_args, ctx) => {
-      const content = `Cursor Bridge — status\n${getCursorStatusLines().map((l) => `  ${l}`).join("\n")}`;
-      if (ctx.hasUI) {
-        pi.sendMessage({ customType: "cursor-bridge", content, display: true });
-      } else {
-        console.log(`[cursor-bridge]\n${content}`);
-      }
-    },
-  });
-
-  // Read stored API key from Pi's AuthStorage at startup
-  extractAuthKey();
 
   /**
    * Adopt a model list as the active set: update the in-memory cache, rebuild
@@ -1744,16 +1624,170 @@ export default async function (pi) {
     }
   }
 
+  /**
+   * /cursor-refresh-models: re-read auth, clear the disk + in-memory caches,
+   * and re-register the provider (SDK preferred, CLI otherwise).
+   * @param {{ hasUI: boolean }} ctx — Pi command context
+   */
+  async function refresh(ctx) {
+    // M3: a mid-session /login changes the stored key — re-read it (a cheap
+    // file read) so the CLI spawns and the SDK backend pick up the new key
+    // without a Pi restart.
+    extractAuthKey();
+    setCursorSdkAuthKey(cachedAuthKey);
+
+    // 1. Clear disk cache
+    try { fs.unlinkSync(getCacheFilePath()); } catch {}
+
+    // 2. Reset in-memory state
+    modelsCache = [];
+    modelsCacheTime = 0;
+    modelsCacheOrigin = null;
+    modelCatalog.clear();
+
+    // 3. Re-register. Prefer the SDK backend (re-discovers its catalog);
+    //    otherwise re-fetch from the CLI (disk cache cleared → hits CLI).
+    try {
+      const sdkResult = await tryRegisterSdkProvider(pi);
+      let count;
+      let via;
+      if (sdkResult) {
+        count = sdkResult.count;
+        via = "@cursor/sdk";
+      } else {
+        const freshModels = await getModels();
+        const modelConfigs = buildModelConfigs(freshModels);
+        registerCursorProvider(pi, modelConfigs);
+        count = modelConfigs.length;
+        via = "cursor-agent CLI";
+        cursorStatus.backend = "CLI/proxy";
+        cursorStatus.modelCount = count;
+        cursorStatus.modelSource = "cursor-agent CLI";
+      }
+
+      // L5: discovering zero models is a failure to surface, not a "success".
+      if (count === 0) {
+        const warn = `No models discovered via ${via} — check auth (/login) and connectivity, then retry.`;
+        if (ctx.hasUI) {
+          pi.sendMessage({ customType: "cursor-bridge", content: warn, display: true });
+        } else {
+          console.warn(`[cursor-bridge] ${warn}`);
+        }
+      } else if (ctx.hasUI) {
+        pi.sendMessage({
+          customType: "cursor-bridge",
+          content: `Refreshed ${count} models via ${via}`,
+          display: true,
+        });
+      } else {
+        console.log(`[cursor-bridge] Refreshed ${count} models via ${via}`);
+      }
+    } catch (err) {
+      const msg = `Failed to refresh models: ${err.message}`;
+      if (ctx.hasUI) {
+        pi.sendMessage({
+          customType: "cursor-bridge",
+          content: msg,
+          display: true,
+        });
+      } else {
+        console.error(`[cursor-bridge] ${msg}`);
+      }
+    }
+  }
+
+  return {
+    getModels,
+    adoptModels,
+    attachToExistingProxy,
+    refresh,
+    /** Current model-list origin: "disk" | "cli" | "stale-disk" | "fallback" | null */
+    get origin() { return modelsCacheOrigin; },
+  };
+}
+
+export default async function (pi) {
+  // Load the pure helpers (see loadSdkHelpers) before anything uses them — the
+  // unhandledRejection guard below (isSdkRejection) and all request handling.
+  // A failure here is fatal and surfaces clearly at load, rather than as a
+  // confusing "undefined is not a function" on the first request.
+  await loadSdkHelpers();
+  activePi = pi; // capture for notifyCursor (used by the bridge abort handler)
+
+  // The local @cursor/sdk leaks internal async rejections during agent
+  // init/cancel (e.g. initializeIgnoreMapping's RxJS pipeline). Without a
+  // handler these can crash the host or print scary stacks. Swallow ONLY
+  // SDK-originated rejections; re-surface anything else so real bugs aren't
+  // hidden. Registered once (reload-safe) to avoid accumulating handlers.
+  if (!globalThis.__piCursorBridgeSdkRejectionGuard) {
+    globalThis.__piCursorBridgeSdkRejectionGuard = true;
+    // PROCESS-GLOBAL side effect: this listener suppresses Node's default
+    // crash-on-unhandled-rejection for the WHOLE Pi process. We keep it
+    // deliberately — crashing all of Pi over one stray cross-turn SDK leak is
+    // worse than a log — but it now only swallows rejections whose TOP stack
+    // frame is inside @cursor/sdk (isSdkRejection). Everything else is logged so
+    // real application bugs stay visible rather than being silently dropped. (M5)
+    process.on("unhandledRejection", (reason) => {
+      if (isSdkRejection(reason)) return; // benign cross-turn SDK leak
+      console.error("[cursor-bridge] unhandled rejection:", reason);
+    });
+  }
+  scheduleStartupLog(pi);
+
+  if (process.env.PI_CURSOR_AGENT_DISABLE === "1") {
+    cursorStatus.backend = "disabled";
+    cursorStatus.reason = "PI_CURSOR_AGENT_DISABLE=1";
+    cursorStatus.proxy = "disabled";
+    startupLog = { lines: ["Disabled via PI_CURSOR_AGENT_DISABLE=1"] };
+    return;
+  }
+
+  // Close any server from a previous load so /reload re-binds the port with
+  // the latest handler code instead of silently reusing the stale server.
+  const PREV = globalThis.__piCursorBridgeServer;
+  if (PREV) {
+    try { PREV.close(); } catch {}
+    globalThis.__piCursorBridgeServer = null;
+  }
+
+  modelCatalog = new ModelCatalog(); // populated alongside models by service.adoptModels()
+  const service = createModelService(pi);
+
+  // Register /cursor-refresh-models command early so it's available on all
+  // startup paths (new proxy, peer-attach, and disabled).
+  pi.registerCommand("cursor-refresh-models", {
+    description: "Refresh the Cursor model list (re-discovers via the active SDK or CLI backend)",
+    handler: async (_args, ctx) => service.refresh(ctx),
+  });
+
+  // Report the active backend (SDK vs CLI/proxy), why, model source, auth,
+  // proxy, runtime, and in-flight tool-bridge runs. Backend selection is
+  // otherwise silent, so this is the go-to diagnostic.
+  pi.registerCommand("cursor-status", {
+    description: "Show Cursor backend status (SDK vs CLI, models, auth, proxy)",
+    handler: async (_args, ctx) => {
+      const content = `Cursor Bridge — status\n${getCursorStatusLines().map((l) => `  ${l}`).join("\n")}`;
+      if (ctx.hasUI) {
+        pi.sendMessage({ customType: "cursor-bridge", content, display: true });
+      } else {
+        console.log(`[cursor-bridge]\n${content}`);
+      }
+    },
+  });
+
+  // Read stored API key from Pi's AuthStorage at startup
+  extractAuthKey();
+
   // Fast path: if another Pi instance already runs the proxy, attach to it
   // instead of trying to bind the port (which would EADDRINUSE).
   if (await detectExistingProxy({ host: HOST, port: PORT, serviceId: HEALTH_SERVICE_ID })) {
-    await attachToExistingProxy("another Pi instance owns the port");
+    await service.attachToExistingProxy("another Pi instance owns the port");
     return;
   }
 
   try {
     const server = startProxyServer({
-      modelsFn: getModels,
+      modelsFn: service.getModels,
       catalog: modelCatalog,
       getAuthKey: () => cachedAuthKey,
       host: HOST,
@@ -1783,16 +1817,16 @@ export default async function (pi) {
     const sdkResult = await tryRegisterSdkProvider(pi);
 
     if (!sdkResult) {
-      const models = await getModels();
+      const models = await service.getModels();
       const modelConfigs = buildModelConfigs(models);
       registerCursorProvider(pi, modelConfigs);
       cursorStatus.backend = "CLI/proxy";
       cursorStatus.modelCount = modelConfigs.length;
       cursorStatus.modelSource =
-        modelsCacheOrigin === "disk" ? "disk cache"
-        : modelsCacheOrigin === "cli" ? "cursor-agent CLI"
-        : modelsCacheOrigin === "stale-disk" ? "stale disk cache"
-        : modelsCacheOrigin === "fallback" ? "built-in fallback"
+        service.origin === "disk" ? "disk cache"
+        : service.origin === "cli" ? "cursor-agent CLI"
+        : service.origin === "stale-disk" ? "stale disk cache"
+        : service.origin === "fallback" ? "built-in fallback"
         : "cursor-agent CLI";
     }
     startupLog = { lines: buildStartupLogLines() };
@@ -1801,10 +1835,9 @@ export default async function (pi) {
     // our listen(). Fall back to client-only mode so the user still
     // gets cursor-bridge models instead of a hard failure.
     if (err && err.code === "EADDRINUSE" && (await detectExistingProxy({ host: HOST, port: PORT, serviceId: HEALTH_SERVICE_ID }))) {
-      await attachToExistingProxy("port became busy during startup");
+      await service.attachToExistingProxy("port became busy during startup");
       return;
     }
     startupLog = { error: err.message };
   }
 }
-
