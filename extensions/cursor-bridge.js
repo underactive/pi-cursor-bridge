@@ -775,6 +775,15 @@ function notifyCursor(content) {
 
 const cursorLiveRuns = new Map();
 
+// Opt-in tracing for the cross-turn tool bridge. Set PI_CURSOR_DEBUG=1 to log
+// each streamSimple decision (fresh start vs resume vs stale finalize), tool
+// surfacing, and result delivery — the definitive way to tell a genuine bridge
+// resume-match failure apart from a model that simply re-reads the same file.
+// Reads process.env at call time so it's unaffected by declaration ordering.
+function bridgeDebug(...args) {
+  if (process.env.PI_CURSOR_DEBUG === "1") console.log("[cursor-bridge:debug]", ...args);
+}
+
 // Idle TTL for a parked live run awaiting Pi's tool results. Mirrors the 5-min
 // session timeout so an abandoned bridged turn can't leak its agent, and a
 // stale run can't linger under the shared default key. (H1)
@@ -795,6 +804,9 @@ function bridgeSteeringPreamble(toolNames) {
     "ALWAYS use these tools for file reads/writes/edits, shell commands, and code",
     "search. Do NOT use any built-in equivalents — only the tools listed above act",
     "on the real workspace.",
+    "Trust tool results immediately: do not re-read or re-verify a file you just",
+    "read, and do not re-run a command whose result you already have. Act on the",
+    "result you were given instead of repeating the same call.",
     ...(hints.length ? ["", "## Tool requirements", ...hints] : []),
     "",
   ].join("\n");
@@ -840,6 +852,7 @@ function buildBridgeCustomTools(liveRun, tools) {
 function bridgeExecute(liveRun, piToolName, args, ctx) {
   if (liveRun.aborted || liveRun.settled) return Promise.reject(makeSdkAbort());
   const toolCallId = (ctx && ctx.toolCallId) || `bridge-${liveRun.callSeq++}`;
+  bridgeDebug(`bridgeExecute piTool=${piToolName} toolCallId=${toolCallId} pendingSize=${liveRun.pendingTools.size + 1}`);
   const normalizedArgs = normalizeBridgeToolArgs(piToolName, args);
   const d = makeSdkDeferred();
   liveRun.pendingTools.set(toolCallId, { d, piToolName, args: normalizedArgs, surfaced: false });
@@ -1159,6 +1172,7 @@ async function resumeBridgeRun(liveRun, stream, context, model, options) {
     const p = liveRun.pendingTools.get(tr.toolCallId);
     if (p) { liveRun.pendingTools.delete(tr.toolCallId); p.d.resolve(toolResultToString(tr)); }
   }
+  bridgeDebug(`resumeBridgeRun delivered=${results.length} remainingPending=${liveRun.pendingTools.size}`);
 
   // If tools issued after the previous turn ended are still un-surfaced, surface
   // them now (prevents the agent deadlocking on a tool Pi never saw). The
@@ -1180,9 +1194,23 @@ function streamCursorSdk(model, context, options) {
 
   (async () => {
     const existing = cursorLiveRuns.get(sessionKey);
+    if (process.env.PI_CURSOR_DEBUG === "1") {
+      const trailing = getTrailingToolResults(context);
+      bridgeDebug(
+        `streamCursorSdk sessionKey=${sessionKey} hasExisting=${!!existing} settled=${existing?.settled} ` +
+        `pendingSize=${existing?.pendingTools?.size ?? 0} resumeMatch=${existing ? resumeMatches(existing, context) : false} ` +
+        `abortTrail=${hasTrailingBridgeToolAbort(context)}`,
+      );
+      if (trailing.length) {
+        bridgeDebug(`  trailing toolResults: ${trailing.map((tr) => `${tr.toolCallId}(${tr.toolName})`).join(", ")}`);
+        if (existing) bridgeDebug(`  pending tool ids: ${[...existing.pendingTools.keys()].join(", ") || "(none)"}`);
+      }
+    }
     if (existing && !existing.settled && existing.pendingTools.size > 0 && resumeMatches(existing, context)) {
+      bridgeDebug("decision=RESUME");
       await resumeBridgeRun(existing, stream, context, model, options);
     } else if (hasTrailingBridgeToolAbort(context)) {
+      bridgeDebug("decision=ABORT_TRAIL");
       if (existing && !existing.settled) abortBridgeRun(existing, false);
       const partial = makeSdkInitialMessage(model);
       finalizeSdkAbort(stream, new SdkPartialEmitter(stream, partial), partial);
@@ -1191,8 +1219,10 @@ function streamCursorSdk(model, context, options) {
       // after an abandoned turn) is stale — finalize it before starting fresh so
       // its pending tool calls aren't re-surfaced into this new conversation.
       if (existing && !existing.settled) {
+        bridgeDebug("stale live run under key — finalizing before fresh start");
         finalizeBridge(existing, existing.sessionKey, null, makeSdkAbort(), existing.apiKey);
       }
+      bridgeDebug("decision=FRESH_START");
       await startBridgeRun(sessionKey, stream, model, context, options);
     }
   })().catch((error) => {
